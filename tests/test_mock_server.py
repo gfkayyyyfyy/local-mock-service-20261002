@@ -11,6 +11,7 @@
 """
 
 import json
+import math
 import os
 import socket
 import subprocess
@@ -678,6 +679,206 @@ class NonStandardNumberTests(unittest.TestCase):
                 status, headers, raw = request(port, "GET", "/value")
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+            finally:
+                server.stop()
+
+
+OVERFLOW_NUMBER_TEMPLATES = {
+    # (说明, 规则文本)：解析后得到 inf/-inf 的合法 JSON 数字，
+    # 无论位于何处都应令整份规则加载失败
+    "1e400 位于 body 顶层": (
+        '{"routes":[{"method":"GET","path":"/value",'
+        '"body":{"n":1e400}}]}'
+    ),
+    "-1e400 位于 body 顶层": (
+        '{"routes":[{"method":"GET","path":"/value",'
+        '"body":{"n":-1e400}}]}'
+    ),
+    "1E+400 大写指数": (
+        '{"routes":[{"method":"GET","path":"/value",'
+        '"body":{"n":1E+400}}]}'
+    ),
+    "嵌套对象中": (
+        '{"routes":[{"method":"GET","path":"/value",'
+        '"body":{"outer":{"inner":{"n":1e400}}}}]}'
+    ),
+    "嵌套数组中": (
+        '{"routes":[{"method":"GET","path":"/value",'
+        '"body":{"list":[1,[2,[1e400]]]}}]}'
+    ),
+    "body 直接为溢出数字": (
+        '{"routes":[{"method":"GET","path":"/value","body":-1e400}]}'
+    ),
+    "被忽略的额外字段中": (
+        '{"routes":[{"method":"GET","path":"/ok","body":{}}],'
+        '"extra":{"note":1e400}}'
+    ),
+    "路由项中被忽略的额外字段": (
+        '{"routes":[{"method":"GET","path":"/ok","body":{},'
+        '"ignored":{"v":1e400}}]}'
+    ),
+    "存在合法路由时仍整份失败": (
+        '{"routes":[{"method":"GET","path":"/ok",'
+        '"body":{"fine":1}},{"method":"POST","path":"/bad",'
+        '"body":{"n":1e400}}]}'
+    ),
+}
+
+
+class OverflowNumberTests(unittest.TestCase):
+    """1e400 等解析为 inf/-inf 的合法 JSON 数字：启动期整份规则拒绝。"""
+
+    def _assert_non_finite_error(self, ctx):
+        message = str(ctx.exception)
+        self.assertIn(
+            "non-finite number", message,
+            f"错误消息应包含 'non-finite number'，实际消息={message!r}",
+        )
+
+    def test_load_rules_raises_rules_error(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for label, text in OVERFLOW_NUMBER_TEMPLATES.items():
+                with self.subTest(位置=label):
+                    rules_path = write_rules_text(
+                        tmp, f"rules_ovf_{label}.json", text
+                    )
+                    with self.assertRaises(
+                        RulesError,
+                        msg=f"{label} 应使 load_rules 抛出 RulesError",
+                    ) as ctx:
+                        load_rules(rules_path)
+                    self._assert_non_finite_error(ctx)
+
+    def test_cli_rejects_overflow_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for label, text in OVERFLOW_NUMBER_TEMPLATES.items():
+                with self.subTest(位置=label):
+                    rules_path = write_rules_text(
+                        tmp, f"rules_ovf_cli_{label}.json", text
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"{label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        "non-finite number", stderr,
+                        f"{label}: 标准错误应包含 'non-finite number'，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        "Traceback", stderr,
+                        f"{label}: 不应出现 Python 异常回溯，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER, stdout,
+                        f"{label}: 标准输出不应出现监听提示，"
+                        f"实际 stdout={stdout!r}",
+                    )
+
+    def test_port_reusable_after_overflow_failure(self):
+        # 加载失败的进程不得占用端口：同一端口随后启动合法规则应成功
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            bad_path = write_rules_text(
+                tmp, "rules_overflow_bad.json",
+                '{"routes":[{"method":"GET","path":"/value",'
+                '"body":{"n":1e400}}]}',
+            )
+            good_path = write_rules(
+                tmp, "rules_overflow_good.json",
+                [{"method": "GET", "path": "/value", "body": {"ok": True}}],
+            )
+            port = free_port()
+            returncode, stdout, stderr = start_and_wait_exit(bad_path, port)
+            self.assertEqual(returncode, 2)
+            self.assertIn("non-finite number", stderr)
+
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+            finally:
+                server.stop()
+
+
+class FiniteValueRegressionTests(unittest.TestCase):
+    """有限值对照：接近但未溢出/下溢为 0 的数字与字符串形态保持原语义。"""
+
+    BODY = {"n": 1e308, "tiny": 1e-400, "text": "1e400", "empty": None}
+
+    def test_finite_numbers_served_compatibly(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules_text(
+                tmp, "rules_finite.json",
+                '{"routes":[{"method":"GET","path":"/value",'
+                '"body":{"n":1e308,"tiny":1e-400,'
+                '"text":"1e400","empty":null}}]}',
+            )
+            # 入口一：直接调用 load_rules 应成功
+            from mock_server import load_rules
+
+            routes = load_rules(rules_path)
+            self.assertIn(("GET", "/value"), routes)
+
+            # 入口二：经命令行启动并核对实际响应
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                body = json.loads(raw.decode("utf-8"))
+                self.assertIn("n", body)
+                self.assertTrue(
+                    math.isfinite(body["n"]),
+                    f"n 应为有限数，实际 {body['n']!r}",
+                )
+                # 1e308 仍是最大量级附近的有限浮点数
+                self.assertEqual(body["n"], 1e308)
+                # 下溢按现有浮点语义变为 0.0
+                self.assertEqual(body["tiny"], 0.0)
+                self.assertEqual(body["text"], "1e400")
+                self.assertIsNone(body["empty"])
+                # 字节级紧凑 UTF-8 JSON 与 Content-Length 保持不变
+                expected_raw = json.dumps(
+                    self.BODY, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                self.assertEqual(raw, expected_raw)
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+            finally:
+                server.stop()
+
+    def test_infinity_string_and_nan_key_unchanged(self):
+        body = {
+            "text_inf": "Infinity",
+            "text_neg_inf": "-Infinity",
+            "NaN": "键名保持原样",
+            "integer": 42,
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_strings.json",
+                [{"method": "GET", "path": "/value", "body": body}],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(json.loads(raw.decode("utf-8")), body)
+                expected_raw = json.dumps(
+                    body, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                self.assertEqual(raw, expected_raw)
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
             finally:
                 server.stop()
 
