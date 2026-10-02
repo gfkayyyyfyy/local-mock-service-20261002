@@ -1435,5 +1435,218 @@ class ValidStructureControlTests(unittest.TestCase):
                 server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 启动期 path 校验回归
+#
+# 下列样例全部由 json.dumps 产出为 UTF-8 JSON，除 path 外的规则内容均合法
+# （method 合法、body 可编码、status 缺省），因此失败只能归因于 path 校验。
+# 每个非法 path 分别放在 routes[0] 与一条合法路由之后的 routes[1]，每份
+# 文件只放一个非法项；整份规则必须加载失败，绝不返回部分路由。
+# ---------------------------------------------------------------------------
+
+INVALID_PATH_CASES = [
+    # (说明, 非法 path 的 JSON 值)
+    ("null", None),
+    ("布尔 true", True),
+    ("整数 123", 123),
+    ("浮点数 1.5", 1.5),
+    ("空数组 []", []),
+    ("空对象 {}", {}),
+    ("空字符串", ""),
+    ("hello（不以 / 开头）", "hello"),
+    ("hello/x（不以 / 开头）", "hello/x"),
+    ("/hello?x=1（规则 path 中含问号）", "/hello?x=1"),
+    ("/hello#part（规则 path 中含井号）", "/hello#part"),
+]
+
+# routes[1] 样例中位于非法项之前的合法路由
+VALID_LEADING_ROUTE = {"method": "GET", "path": "/ok", "body": {"fine": 1}}
+
+# 合法对照：根路径路由与配置对象的紧凑 UTF-8 响应字节
+VALID_ROOT_ROUTES = [
+    {"method": "GET", "path": "/", "body": {"message": "你好"}}
+]
+VALID_ROOT_BODY_BYTES = '{"message":"你好"}'.encode("utf-8")
+
+
+def invalid_path_samples():
+    """展开为 (序号, 说明, 非法path, 非法项下标, routes 内容) 的全部样例。"""
+    seq = 0
+    for label, bad_path in INVALID_PATH_CASES:
+        yield seq, label, bad_path, 0, [
+            {"method": "GET", "path": bad_path, "body": {"v": 1}}
+        ]
+        seq += 1
+        yield seq, label, bad_path, 1, [
+            VALID_LEADING_ROUTE,
+            {"method": "POST", "path": bad_path, "body": {"v": 2}},
+        ]
+        seq += 1
+
+
+def _path_error_fragment(bad_path):
+    """错误文本中用于定位实际 path 的片段：非字符串与空串取 repr。"""
+    if not isinstance(bad_path, str) or bad_path == "":
+        return repr(bad_path)
+    return bad_path
+
+
+class InvalidPathTests(unittest.TestCase):
+    """非法 path：直接加载抛 RulesError，命令行入口退出码 2。"""
+
+    def test_load_rules_raises_rules_error_for_invalid_path(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for seq, label, bad_path, bad_index, items in invalid_path_samples():
+                with self.subTest(样例=label, 位置=f"routes[{bad_index}]"):
+                    rules_path = write_rules(
+                        tmp, f"rules_badpath_{seq}.json", items
+                    )
+                    # 抛异常即证明没有返回（含部分）路由字典
+                    with self.assertRaises(
+                        RulesError,
+                        msg=f"入口 load_rules，样例 {label!r} @ "
+                            f"routes[{bad_index}]: 应抛出 RulesError，"
+                            f"不得返回部分路由",
+                    ) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn(
+                        f"routes[{bad_index}]",
+                        message,
+                        f"入口 load_rules，样例 {label!r}: 错误应标明实际下标 "
+                        f"routes[{bad_index}]，实际消息={message!r}",
+                    )
+                    fragment = _path_error_fragment(bad_path)
+                    self.assertIn(
+                        fragment,
+                        message,
+                        f"入口 load_rules，样例 {label!r}: 错误应标明实际 path "
+                        f"{fragment!r}，实际消息={message!r}",
+                    )
+
+    def test_cli_rejects_invalid_path_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for seq, label, bad_path, bad_index, items in invalid_path_samples():
+                with self.subTest(样例=label, 位置=f"routes[{bad_index}]"):
+                    rules_path = write_rules(
+                        tmp, f"rules_badpath_cli_{seq}.json", items
+                    )
+                    # start_and_wait_exit 保证超时也会杀掉并回收子进程
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"入口 python -m mock_server，样例 {label!r} @ "
+                        f"routes[{bad_index}]: 期望退出码 2，实际 "
+                        f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        f"routes[{bad_index}]",
+                        stderr,
+                        f"入口 python -m mock_server，样例 {label!r}: "
+                        f"标准错误应标明实际下标 routes[{bad_index}]，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    fragment = _path_error_fragment(bad_path)
+                    self.assertIn(
+                        fragment,
+                        stderr,
+                        f"入口 python -m mock_server，样例 {label!r}: "
+                        f"标准错误应标明实际 path {fragment!r}，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        "Traceback",
+                        stderr,
+                        f"入口 python -m mock_server，样例 {label!r}: "
+                        f"不应出现 Python 异常回溯，实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER,
+                        stdout,
+                        f"入口 python -m mock_server，样例 {label!r}: "
+                        f"校验失败时标准输出不应出现监听提示，"
+                        f"实际 stdout={stdout!r}",
+                    )
+
+    def test_port_reusable_after_invalid_path_failure(self):
+        # 选取规则 path 含问号的非法样例：失败进程退出后，同一端口必须能
+        # 启动合法规则并取得响应，证明拒绝加载没有留下监听服务
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            bad_path = write_rules(
+                tmp,
+                "rules_badpath_port.json",
+                [{"method": "GET", "path": "/hello?x=1", "body": {}}],
+            )
+            good_path = write_rules(
+                tmp, "rules_root_port.json", VALID_ROOT_ROUTES
+            )
+            port = free_port()
+            returncode, stdout, stderr = start_and_wait_exit(bad_path, port)
+            self.assertEqual(
+                returncode, 2,
+                f"非法 path 样例期望退出码 2，实际 {returncode}；"
+                f"stdout={stdout!r} stderr={stderr!r}",
+            )
+            self.assertIn("routes[0]", stderr)
+            self.assertIn("/hello?x=1", stderr)
+
+            # 同一端口启动合法根路径规则，并携带查询串请求以取得响应
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/?x=1")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(raw, VALID_ROOT_BODY_BYTES)
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+            finally:
+                server.stop()
+
+
+class ValidRootPathControlTests(unittest.TestCase):
+    """合法对照：根路径路由加载为默认 200 的 UTF-8 响应；请求 /?x=1 命中。
+
+    规则 path 中的问号被拒绝（见 InvalidPathTests）与请求中的查询字符串
+    在匹配时被忽略，是两种各自既有的行为，本测试固定后者。
+    """
+
+    def test_load_rules_root_route_defaults_to_200_utf8_bytes(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_root.json", VALID_ROOT_ROUTES)
+            routes = load_rules(rules_path)
+            # 只有根路径这一条路由
+            self.assertEqual(set(routes), {("GET", "/")})
+            # status 缺省为 200；body 为配置对象的紧凑 UTF-8 JSON 字节
+            self.assertEqual(
+                routes[("GET", "/")], (200, VALID_ROOT_BODY_BYTES)
+            )
+
+    def test_cli_serves_root_route_when_request_has_query_string(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_root_cli.json", VALID_ROOT_ROUTES)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/?x=1")
+                self.assertEqual(
+                    status, 200,
+                    f"GET /?x=1 应命中根路径路由并返回 200，实际 {status}",
+                )
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"message": "你好"}
+                )
+                self.assertEqual(raw, VALID_ROOT_BODY_BYTES)
+                # Content-Length 等于实际响应体字节数（中文按 UTF-8 计 3 字节）
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
