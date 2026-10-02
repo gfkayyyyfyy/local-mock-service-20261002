@@ -1,7 +1,73 @@
-# 可配置本地模拟服务
+# mock_server
 
-建设帮助前后端独立开发的本地模拟服务产品，逐步覆盖路由匹配、请求样例校验、固定与模板响应、场景切换、请求记录、可控错误注入及基础 JSON-RPC 模拟。
+仅使用 Python 3 标准库实现的本地 mock 服务：启动时加载 JSON 规则文件，之后对匹配的请求返回固定响应。服务始终绑定 `127.0.0.1`。
 
-计划采用：Python 3 标准库 / http.server / json / argparse。
+## 用法
 
-当前仓库处于初始化阶段，尚未提供可运行功能。
+```bash
+python -m mock_server --rules rules.json --port 8765
+```
+
+- `--rules`：必填，JSON 规则文件路径。
+- `--port`：可选，监听端口，1–65535 的整数，默认 `8765`。
+
+启动成功后向标准输出打印监听地址，例如：
+
+```
+mock_server listening on http://127.0.0.1:8765 (1 route(s))
+```
+
+按 `Ctrl+C` 停止服务并释放端口。规则仅在启动时加载一次，之后修改文件不影响响应。
+
+## 规则文件格式
+
+UTF-8 编码的 JSON，顶层为对象，含 `routes` 数组；每项为含 `method`、`path`、`body` 三个字段的对象：
+
+```json
+{"routes":[{"method":"GET","path":"/hello","body":{"message":"你好"}}]}
+```
+
+- `method`：仅接受大写 `"GET"` 或 `"POST"`。
+- `path`：以 `/` 开头、不含 `?` 和 `#` 的字符串。
+- `body`：任意 JSON 值（包括 `null`），命中时作为响应体返回。
+- `routes` 可以为空数组；路由项中的额外字段会被忽略。
+- 不允许重复的 `method` + `path` 组合。
+
+## 请求匹配与响应
+
+- 匹配时忽略查询字符串和请求体；路径的大小写、尾部斜杠、百分号转义按原样比较。
+- `GET` / `POST` 命中：返回 HTTP 200 及配置的 `body`。
+- 未命中：返回 HTTP 404 及 `{"error":"route_not_found"}`。
+- 其他 HTTP 方法不予处理（返回 501）。
+- 所有响应均为 UTF-8 JSON，`Content-Type: application/json; charset=utf-8`，`Content-Length` 为实际字节数。
+
+## 示例
+
+```bash
+$ python -m mock_server --rules rules.json &
+$ curl -i "http://127.0.0.1:8765/hello?x=1"
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 25
+
+{"message":"你好"}
+
+$ curl -i "http://127.0.0.1:8765/missing"
+HTTP/1.1 404 Not Found
+Content-Type: application/json; charset=utf-8
+Content-Length: 27
+
+{"error":"route_not_found"}
+```
+
+## 错误处理
+
+以下情况均向标准错误输出原因并以退出码 2 结束，不接收请求：
+
+- 参数缺失或无效（端口非整数或超出 1–65535）
+- 规则文件不存在或不可读
+- 文件不是合法 UTF-8
+- JSON 语法错误
+- 规则结构非法（顶层非对象、缺少 `routes` 数组等）
+- 路由项缺少必填字段、`method` 或 `path` 非法、规则重复
+- 端口被占用
