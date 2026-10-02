@@ -120,9 +120,17 @@ def load_rules(path):
                 f"{where}: status must be the integer 200 or an integer "
                 f"between 400 and 599, got {status!r}"
             )
-        body = json.dumps(
-            item["body"], ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        try:
+            body = json.dumps(
+                item["body"], ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            # body 中的字符串值或对象键含未配对的代理码点（如孤立 \ud800、
+            # 方向颠倒的代理对）时无法编码为合法 UTF-8 响应；与既有规则
+            # 错误一致，整份规则加载失败
+            raise RulesError(
+                f"{where}.body cannot be encoded as UTF-8: {exc}"
+            )
         routes[key] = (status, body)
     return routes
 

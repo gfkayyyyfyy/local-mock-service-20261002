@@ -927,5 +927,203 @@ class LegalStringAndNumberTests(unittest.TestCase):
                 server.stop()
 
 
+UNPAIRED_SURROGATE_TEMPLATES = {
+    # (说明, 规则文本, 出错路由下标)：body 的字符串值或对象键含未配对代理
+    # 码点，无法编码为 UTF-8 响应，整份规则应加载失败
+    "孤立高代理位于 body 字符串": (
+        '{"routes":[{"method":"GET","path":"/bad","body":"\\ud800"}]}', 0,
+    ),
+    "孤立低代理位于 body 字符串": (
+        '{"routes":[{"method":"GET","path":"/bad","body":"\\udc00"}]}', 0,
+    ),
+    "低代理在前高代理在后（未组成合法字符）": (
+        '{"routes":[{"method":"GET","path":"/bad","body":"\\udc00\\ud800"}]}',
+        0,
+    ),
+    "两个高代理相连": (
+        '{"routes":[{"method":"GET","path":"/bad","body":"\\ud800\\ud800"}]}',
+        0,
+    ),
+    "嵌套数组中的字符串": (
+        '{"routes":[{"method":"GET","path":"/bad",'
+        '"body":{"list":["ok",["\\ud800"]]}}]}',
+        0,
+    ),
+    "嵌套对象中的字符串": (
+        '{"routes":[{"method":"GET","path":"/bad",'
+        '"body":{"outer":{"inner":"\\udc00"}}}]}',
+        0,
+    ),
+    "body 直接为孤立代理字符串": (
+        '{"routes":[{"method":"GET","path":"/bad","body":"\\ud800"}]}', 0,
+    ),
+    "对象键含孤立代理": (
+        '{"routes":[{"method":"GET","path":"/bad","body":{"\\ud800":1}}]}', 0,
+    ),
+    "存在合法路由时仍整份失败": (
+        '{"routes":[{"method":"GET","path":"/ok","body":{"fine":1}},'
+        '{"method":"POST","path":"/bad","body":"\\ud800"}]}',
+        1,
+    ),
+}
+
+
+class UnpairedSurrogateTests(unittest.TestCase):
+    """body 字符串值/对象键含未配对代理码点：启动期整份规则拒绝。"""
+
+    def test_load_rules_raises_rules_error(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for label, (text, index) in UNPAIRED_SURROGATE_TEMPLATES.items():
+                with self.subTest(位置=label):
+                    rules_path = write_rules_text(
+                        tmp, f"rules_sur_{label}.json", text
+                    )
+                    with self.assertRaises(
+                        RulesError,
+                        msg=f"{label} 应使 load_rules 抛出 RulesError",
+                    ) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn(
+                        f"routes[{index}].body", message,
+                        f"{label}: 错误消息应标明 routes[{index}].body，"
+                        f"实际消息={message!r}",
+                    )
+                    self.assertIn(
+                        "UTF-8", message,
+                        f"{label}: 错误消息应包含 'UTF-8'，实际消息={message!r}",
+                    )
+
+    def test_cli_rejects_unpaired_surrogates_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for label, (text, index) in UNPAIRED_SURROGATE_TEMPLATES.items():
+                with self.subTest(位置=label):
+                    rules_path = write_rules_text(
+                        tmp, f"rules_sur_cli_{label}.json", text
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"{label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        f"routes[{index}].body", stderr,
+                        f"{label}: 标准错误应标明 routes[{index}].body，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        "UTF-8", stderr,
+                        f"{label}: 标准错误应包含 'UTF-8'，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        "Traceback", stderr,
+                        f"{label}: 不应出现 Python 异常回溯，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER, stdout,
+                        f"{label}: 标准输出不应出现监听提示，"
+                        f"实际 stdout={stdout!r}",
+                    )
+
+    def test_port_reusable_after_surrogate_failure(self):
+        # 加载失败的进程不得占用端口：同一端口随后启动合法规则应成功
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            bad_path = write_rules_text(
+                tmp, "rules_sur_bad.json",
+                '{"routes":[{"method":"GET","path":"/bad","body":"\\ud800"}]}',
+            )
+            good_path = write_rules(
+                tmp, "rules_sur_good.json",
+                [{"method": "GET", "path": "/ok", "body": {"ok": True}}],
+            )
+            port = free_port()
+            returncode, stdout, stderr = start_and_wait_exit(bad_path, port)
+            self.assertEqual(returncode, 2)
+            self.assertIn("UTF-8", stderr)
+
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/ok")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+            finally:
+                server.stop()
+
+    def test_surrogate_in_ignored_extra_fields_still_loads(self):
+        # 仅被忽略的额外字段含代理码点：不参与响应编码，按原有语义忽略
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules_text(
+                tmp, "rules_sur_extra.json",
+                '{"routes":[{"method":"GET","path":"/ok","body":{"fine":1},'
+                '"ignored":"\\ud800"}],"extra":{"note":"\\udc00"}}',
+            )
+            routes = load_rules(rules_path)
+            self.assertIn(("GET", "/ok"), routes)
+
+
+class LegalUnicodeBodyTests(unittest.TestCase):
+    """合法 Unicode 对照：配对代理、中文与普通文本保持紧凑 UTF-8 响应。"""
+
+    # 规则文本中 \\ud83d\\ude00 是正确配对的代理转义（😀）；
+    # \\\\ud800 解码后是六个普通字符 \ud800（反斜杠加字母 u 等），不应误判
+    RULES_TEXT = (
+        '{"routes":[{"method":"GET","path":"/emoji","body":'
+        '{"face":"\\ud83d\\ude00","text":"你好",'
+        '"literal":"\\\\ud800","num":1,"nil":null}}]}'
+    )
+    EXPECTED_BODY = {
+        "face": "\U0001F600",
+        "text": "你好",
+        "literal": "\\ud800",
+        "num": 1,
+        "nil": None,
+    }
+
+    def test_paired_surrogate_loads_and_serves_utf8(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules_text(
+                tmp, "rules_paired.json", self.RULES_TEXT
+            )
+            expected_raw = json.dumps(
+                self.EXPECTED_BODY, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+
+            # 入口一：直接调用 load_rules 应成功并产出相同的 UTF-8 字节
+            from mock_server import load_rules
+
+            routes = load_rules(rules_path)
+            self.assertIn(("GET", "/emoji"), routes)
+            status, body_bytes = routes[("GET", "/emoji")]
+            self.assertEqual(status, 200)
+            self.assertEqual(body_bytes, expected_raw)
+
+            # 入口二：经命令行启动并核对实际 HTTP 响应
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                code, headers, raw = request(port, "GET", "/emoji")
+                self.assertEqual(code, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(raw, expected_raw)
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                decoded = json.loads(raw.decode("utf-8"))
+                self.assertEqual(decoded, self.EXPECTED_BODY)
+                # 正确配对的转义应解码为 😀，而非替换或转义文本
+                self.assertEqual(decoded["face"], "😀")
+                # 普通文本反斜杠加字母 u 不应被当作代理转义
+                self.assertEqual(decoded["literal"], "\\ud800")
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
