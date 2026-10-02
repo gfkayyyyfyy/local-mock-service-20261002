@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 ALLOWED_METHODS = ("GET", "POST")
+DEFAULT_STATUS = 200
 NOT_FOUND_BODY = b'{"error":"route_not_found"}'
 CONTENT_TYPE = "application/json; charset=utf-8"
 
@@ -30,7 +31,7 @@ def _port(value):
 
 
 def load_rules(path):
-    """加载并校验规则文件，返回 {(method, path): 响应字节} 字典。"""
+    """加载并校验规则文件，返回 {(method, path): (status, 响应字节)} 字典。"""
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -75,9 +76,22 @@ def load_rules(path):
         key = (method, route_path)
         if key in routes:
             raise RulesError(f"{where}: duplicate route {method} {route_path}")
-        routes[key] = json.dumps(
+        status = item.get("status", DEFAULT_STATUS)
+        # bool 是 int 的子类，必须先排除；503.0 等浮点数也不接受
+        if isinstance(status, bool) or not isinstance(status, int):
+            raise RulesError(
+                f"{where}: status must be an integer 200 or 400-599, "
+                f"got {status!r}"
+            )
+        if status != 200 and not 400 <= status <= 599:
+            raise RulesError(
+                f"{where}: status must be 200 or between 400 and 599, "
+                f"got {status}"
+            )
+        body = json.dumps(
             item["body"], ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
+        routes[key] = (status, body)
     return routes
 
 
@@ -100,11 +114,12 @@ def _make_handler(routes):
         def _respond(self):
             self._discard_body()
             path = urlsplit(self.path).path
-            body = routes.get((self.command, path))
-            if body is None:
+            match = routes.get((self.command, path))
+            if match is None:
                 self._send(404, NOT_FOUND_BODY)
             else:
-                self._send(200, body)
+                status, body = match
+                self._send(status, body)
 
         def _send(self, status, body):
             self.send_response(status)
