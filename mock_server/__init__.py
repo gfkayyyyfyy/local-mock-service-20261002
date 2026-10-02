@@ -36,6 +36,12 @@ def _valid_status(value):
     return value == 200 or 400 <= value <= 599
 
 
+def _reject_constant(value):
+    # json.loads 默认接受 NaN/Infinity/-Infinity 三种非标准数字字面量，
+    # 它们不是合法 JSON；无论在文档何处出现都视为格式错误
+    raise ValueError(f"invalid JSON literal {value}")
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 {(method, path): (状态码, 响应字节)} 字典。"""
     try:
@@ -48,8 +54,9 @@ def load_rules(path):
     except UnicodeDecodeError as exc:
         raise RulesError(f"rules file {path!r} is not valid UTF-8: {exc}")
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
+        data = json.loads(text, parse_constant=_reject_constant)
+    except ValueError as exc:
+        # JSONDecodeError 与非标准字面量（ValueError）统一归为 JSON 格式错误
         raise RulesError(f"rules file {path!r} is not valid JSON: {exc}")
 
     if not isinstance(data, dict) or not isinstance(data.get("routes"), list):

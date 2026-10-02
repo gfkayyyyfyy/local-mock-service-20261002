@@ -571,5 +571,160 @@ class DistinctRouteTests(unittest.TestCase):
                 server.stop()
 
 
+NON_STANDARD_LITERALS = ["NaN", "Infinity", "-Infinity"]
+
+
+def write_rules_text(directory, name, text):
+    """直接写入原始文本规则文件（用于构造 json.dumps 无法产出的非法文本）。"""
+    path = Path(directory) / name
+    path.write_bytes(text.encode("utf-8"))
+    return path
+
+
+def literal_rules_templates(literal):
+    """给出同一非法字面量出现在不同位置的规则文本（均为非法 JSON）。"""
+    return {
+        "body 顶层值": (
+            '{"routes":[{"method":"GET","path":"/value",'
+            f'"body":{{"value":{literal}}}}}]'
+        ),
+        "body 嵌套数组与对象中": (
+            '{"routes":[{"method":"GET","path":"/value",'
+            f'"body":{{"list":[1,[2,{{"v":{literal}}}]]}}}}]'
+        ),
+        "被忽略的额外字段中": (
+            '{"routes":[{"method":"GET","path":"/ok","body":{}}],'
+            f'"extra":{{"note":{literal}}}}}'
+        ),
+    }
+
+
+class NonStandardNumberTests(unittest.TestCase):
+    """NaN / Infinity / -Infinity 未加引号出现时，整份规则视为非法 JSON。"""
+
+    def test_load_rules_raises_rules_error(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for literal in NON_STANDARD_LITERALS:
+                for label, text in literal_rules_templates(literal).items():
+                    with self.subTest(literal=literal, 位置=label):
+                        rules_path = write_rules_text(
+                            tmp, f"rules_lit_{label}.json", text
+                        )
+                        with self.assertRaises(
+                            RulesError,
+                            msg=f"{label} 中的 {literal} 应使 load_rules "
+                                f"抛出 RulesError",
+                        ) as ctx:
+                            load_rules(rules_path)
+                        self.assertIn(
+                            "not valid JSON", str(ctx.exception),
+                            f"{label} 中的 {literal}: 错误应属于 JSON 格式错误，"
+                            f"实际消息={ctx.exception}",
+                        )
+
+    def test_cli_rejects_literals_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for literal in NON_STANDARD_LITERALS:
+                for label, text in literal_rules_templates(literal).items():
+                    with self.subTest(literal=literal, 位置=label):
+                        rules_path = write_rules_text(
+                            tmp, f"rules_cli_{label}.json", text
+                        )
+                        returncode, stdout, stderr = start_and_wait_exit(
+                            rules_path, free_port()
+                        )
+                        self.assertEqual(
+                            returncode, 2,
+                            f"{label} 中的 {literal}: 期望退出码 2，实际 "
+                            f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            "not valid JSON", stderr,
+                            f"{label} 中的 {literal}: 标准错误应包含 "
+                            f"'not valid JSON'，实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            "Traceback", stderr,
+                            f"{label} 中的 {literal}: 不应出现 Python 异常回溯，"
+                            f"实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            STARTUP_MARKER, stdout,
+                            f"{label} 中的 {literal}: 标准输出不应出现监听提示，"
+                            f"实际 stdout={stdout!r}",
+                        )
+
+    def test_port_reusable_after_failed_start(self):
+        # 加载失败的进程不得占用端口：同一端口随后启动合法规则应成功
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            bad_path = write_rules_text(
+                tmp, "rules_bad.json",
+                '{"routes":[{"method":"GET","path":"/value",'
+                '"body":{"value":NaN}}]}',
+            )
+            good_path = write_rules(
+                tmp, "rules_good.json",
+                [{"method": "GET", "path": "/value", "body": {"ok": True}}],
+            )
+            port = free_port()
+            returncode, stdout, stderr = start_and_wait_exit(bad_path, port)
+            self.assertEqual(returncode, 2)
+            self.assertIn("not valid JSON", stderr)
+
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+            finally:
+                server.stop()
+
+
+class LegalStringAndNumberTests(unittest.TestCase):
+    """合法边界：字符串 "NaN" 等、普通数字与 null 不得被误判。"""
+
+    BODY = {
+        "s_nan": "NaN",
+        "s_inf": "Infinity",
+        "s_neg_inf": "-Infinity",
+        "NaN": "作为键的字符串",
+        "Infinity": 1,
+        "-Infinity": -1,
+        "int": 42,
+        "neg_int": -7,
+        "float": 3.14,
+        "exp": 1e10,
+        "neg_exp": -2.5e-3,
+        "null": None,
+    }
+
+    def test_legal_body_served_verbatim(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_legal.json",
+                [{"method": "GET", "path": "/value", "body": self.BODY}],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                # 响应 JSON 原样返回，字符串 "NaN" 等不被特殊处理
+                self.assertEqual(json.loads(raw.decode("utf-8")), self.BODY)
+                # 字节级核对：紧凑 JSON 的 UTF-8 编码与 Content-Length 一致
+                expected_raw = json.dumps(
+                    self.BODY, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                self.assertEqual(raw, expected_raw)
+                self.assertEqual(
+                    int(headers["Content-Length"]), len(expected_raw)
+                )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
