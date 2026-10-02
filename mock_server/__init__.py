@@ -47,8 +47,17 @@ def load_rules(path):
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RulesError(f"rules file {path!r} is not valid UTF-8: {exc}")
+    def _reject_constant(name):
+        # json.loads 默认接受 NaN/Infinity/-Infinity 这三种非标准字面量；
+        # 规则文件必须是严格 JSON，遇到即按 JSON 格式错误处理
+        raise json.JSONDecodeError(
+            f"non-standard JSON literal {name} is not allowed",
+            text,
+            max(text.find(name), 0),
+        )
+
     try:
-        data = json.loads(text)
+        data = json.loads(text, parse_constant=_reject_constant)
     except json.JSONDecodeError as exc:
         raise RulesError(f"rules file {path!r} is not valid JSON: {exc}")
 

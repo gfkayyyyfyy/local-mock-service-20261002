@@ -32,6 +32,8 @@ if str(PROJECT_ROOT) not in sys.path:
     # 允许直接以 `python tests/test_mock_server.py` 运行
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from mock_server import RulesError, load_rules
+
 CONTENT_TYPE = "application/json; charset=utf-8"
 STARTUP_MARKER = "mock_server listening"
 STARTUP_TIMEOUT = 10.0
@@ -53,6 +55,13 @@ def write_rules(directory, name, routes):
         {"routes": routes}, ensure_ascii=False, indent=2
     ).encode("utf-8")
     path.write_bytes(payload)
+    return path
+
+
+def write_raw_rules(directory, name, text):
+    """按原始文本写入规则文件（可表达 json.dumps 无法产出的非法字面量）。"""
+    path = Path(directory) / name
+    path.write_bytes(text.encode("utf-8"))
     return path
 
 
@@ -567,6 +576,172 @@ class DistinctRouteTests(unittest.TestCase):
                             json.loads(raw.decode("utf-8")), body,
                             f"GET {path}: 各路径必须独立返回各自配置的响应",
                         )
+            finally:
+                server.stop()
+
+
+NON_STANDARD_LITERALS = ["NaN", "Infinity", "-Infinity"]
+
+
+def _literal_rule_templates(literal):
+    """同一非法字面量出现在不同位置的五份规则文本（标签, 文本）。"""
+    return [
+        (
+            "body 顶层值",
+            '{"routes":[{"method":"GET","path":"/value",'
+            f'"body":{{"value":{literal}}}}}]',
+        ),
+        (
+            "body 嵌套数组",
+            '{"routes":[{"method":"GET","path":"/value",'
+            f'"body":{{"value":[1,[{literal}]]}}}}]',
+        ),
+        (
+            "body 嵌套对象",
+            '{"routes":[{"method":"GET","path":"/value",'
+            f'"body":{{"value":{{"inner":{{"deep":{literal}}}}}}}}}]',
+        ),
+        (
+            "路由对象的额外字段",
+            '{"routes":[{"method":"GET","path":"/value","body":{},'
+            f'"extra":{literal}}}]',
+        ),
+        (
+            "顶层额外字段",
+            '{"routes":[{"method":"GET","path":"/value","body":{}}],'
+            f'"extra":{{"note":[{literal}]}}}}',
+        ),
+    ]
+
+
+class NonStandardLiteralTests(unittest.TestCase):
+    """NaN/Infinity/-Infinity 未加引号出现时，整份规则视为非法 JSON。
+
+    无论字面量位于 body 顶层、嵌套数组/对象，还是不参与响应的额外字段，
+    启动都必须以退出码 2 失败：标准错误说明 JSON 格式错误、无异常回溯、
+    标准输出无监听提示；直接调用 load_rules 统一抛出 RulesError。
+    """
+
+    def test_load_rules_raises_rules_error(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for literal in NON_STANDARD_LITERALS:
+                for index, (label, text) in enumerate(
+                    _literal_rule_templates(literal)
+                ):
+                    with self.subTest(literal=literal, position=label):
+                        rules_path = write_raw_rules(
+                            tmp, f"rules_lit_{index}.json", text
+                        )
+                        with self.assertRaises(
+                            RulesError,
+                            msg=f"{label} 中的 {literal} 应使 load_rules "
+                                f"抛出 RulesError",
+                        ) as ctx:
+                            load_rules(str(rules_path))
+                        self.assertIn(
+                            "not valid JSON", str(ctx.exception),
+                            f"{label} 中的 {literal}: 错误应说明 JSON 格式问题，"
+                            f"实际 {ctx.exception}",
+                        )
+
+    def test_startup_rejected_and_port_reusable(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for literal in NON_STANDARD_LITERALS:
+                for index, (label, text) in enumerate(
+                    _literal_rule_templates(literal)
+                ):
+                    with self.subTest(literal=literal, position=label):
+                        rules_path = write_raw_rules(
+                            tmp, f"rules_lit_{index}.json", text
+                        )
+                        port = free_port()
+                        returncode, stdout, stderr = start_and_wait_exit(
+                            rules_path, port
+                        )
+                        self.assertEqual(
+                            returncode, 2,
+                            f"{label} 中的 {literal}: 期望退出码 2，实际 "
+                            f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            "not valid JSON", stderr,
+                            f"{label} 中的 {literal}: 标准错误应包含 "
+                            f"'not valid JSON'，实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            "Traceback", stderr,
+                            f"{label} 中的 {literal}: 不应出现 Python 异常回溯，"
+                            f"实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            STARTUP_MARKER, stdout,
+                            f"{label} 中的 {literal}: 标准输出不应出现监听提示，"
+                            f"实际 stdout={stdout!r}",
+                        )
+                        # 加载失败后同一端口不遗留占用，合法规则可立即启动
+                        good_path = write_rules(
+                            tmp, f"rules_good_{index}.json",
+                            [{"method": "GET", "path": "/ok",
+                              "body": {"ok": True}}],
+                        )
+                        server = ServerProcess(good_path, port)
+                        try:
+                            status, _, raw = request(port, "GET", "/ok")
+                            self.assertEqual(status, 200)
+                            self.assertEqual(
+                                json.loads(raw.decode("utf-8")), {"ok": True}
+                            )
+                        finally:
+                            server.stop()
+
+
+class LegalLookalikeTests(unittest.TestCase):
+    """合法边界：字符串 "NaN"/"Infinity"/"-Infinity"（含作为对象键）、
+    整数、小数、指数形式数字与 null 继续按现有语义处理，不被误判。"""
+
+    BODY = {
+        "text_values": ["NaN", "Infinity", "-Infinity"],
+        "NaN": "作为键的字符串",
+        "Infinity": 0,
+        "-Infinity": None,
+        "integer": 42,
+        "negative_integer": -7,
+        "fraction": 3.14,
+        "exponent": 1.5e3,
+        "negative_exponent": -2.5E-2,
+        "null_value": None,
+        "nested": {"list": ["NaN", 1, 2.5, None]},
+    }
+
+    def test_legal_body_served_verbatim(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_legal.json",
+                [{"method": "GET", "path": "/legal", "body": self.BODY}],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/legal")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                # Content-Length 必须是响应体实际的 UTF-8 字节数
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                actual = json.loads(raw.decode("utf-8"))
+                self.assertEqual(actual, self.BODY)
+                # 字符串值原样保留，未被当作特殊数值处理
+                self.assertEqual(
+                    actual["text_values"], ["NaN", "Infinity", "-Infinity"]
+                )
+                self.assertEqual(actual["NaN"], "作为键的字符串")
+                self.assertIsNone(actual["null_value"])
+                self.assertIsInstance(actual["integer"], int)
+                self.assertIsInstance(actual["fraction"], float)
+                # 响应字节与紧凑 JSON 序列化完全一致
+                expected_raw = json.dumps(
+                    self.BODY, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                self.assertEqual(raw, expected_raw)
             finally:
                 server.stop()
 
