@@ -283,6 +283,199 @@ class StatusBoundaryTests(unittest.TestCase):
                 server.stop()
 
 
+def run_server_once(rules_path, port):
+    """以现有命令行入口启动一次 mock_server 并等待其结束，返回 CompletedProcess。
+
+    超时（超过 STARTUP_TIMEOUT）由调用方判为失败；subprocess.run 在超时
+    时会先终止子进程再抛出，因此不会遗留进程。
+    """
+    return subprocess.run(
+        [
+            sys.executable, "-m", "mock_server",
+            "--rules", str(rules_path),
+            "--port", str(port),
+        ],
+        cwd=str(PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=STARTUP_TIMEOUT,
+    )
+
+
+# 重复路由样例：(说明, routes, 后出现规则在 routes 中的下标, 重复的方法, 重复的路径)
+# 覆盖相邻与非相邻重复；两条规则的 body 与 status 相同或不同均不改变重复判断
+DUPLICATE_ROUTES = [
+    (
+        "相邻重复，body 与缺省 status 完全相同",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "GET", "path": "/same", "body": 1},
+        ],
+        1, "GET", "/same",
+    ),
+    (
+        "相邻重复，body 与 status 均不同",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "GET", "path": "/same", "status": 503, "body": 2},
+        ],
+        1, "GET", "/same",
+    ),
+    (
+        "非相邻重复（中间插入合法且不同的路由），body 与缺省 status 相同",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "POST", "path": "/between", "status": 400,
+             "body": {"ok": True}},
+            {"method": "GET", "path": "/same", "body": 1},
+        ],
+        2, "GET", "/same",
+    ),
+    (
+        "非相邻重复（中间插入合法且不同的路由），body 与 status 均不同",
+        [
+            {"method": "GET", "path": "/same", "status": 503, "body": 2},
+            {"method": "GET", "path": "/other", "body": {"ok": True}},
+            {"method": "GET", "path": "/same", "body": 1},
+        ],
+        2, "GET", "/same",
+    ),
+]
+
+
+class DuplicateRouteStartupTests(unittest.TestCase):
+    """启动期路由唯一性检查：重复 method+path 经公开入口启动应以退出码 2 失败。"""
+
+    def test_duplicate_routes_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, routes, dup_index, method, path) in enumerate(
+                DUPLICATE_ROUTES
+            ):
+                with self.subTest(sample=label):
+                    rules_path = write_rules(
+                        tmp, f"rules_dup_{index}.json", routes
+                    )
+                    try:
+                        proc = run_server_once(rules_path, free_port())
+                    except subprocess.TimeoutExpired:
+                        self.fail(
+                            f"样例 {label}: 启动未在 {STARTUP_TIMEOUT}s 内结束"
+                        )
+                    self.assertEqual(
+                        proc.returncode, 2,
+                        f"样例 {label}: 期望退出码 2，实际 "
+                        f"{proc.returncode}；stdout={proc.stdout!r} "
+                        f"stderr={proc.stderr!r}",
+                    )
+                    self.assertIn(
+                        "duplicate route", proc.stderr,
+                        f"样例 {label}: 标准错误应包含 duplicate route，"
+                        f"实际 stderr={proc.stderr!r}",
+                    )
+                    self.assertIn(
+                        f"routes[{dup_index}]",
+                        proc.stderr,
+                        f"样例 {label}: 标准错误应标明后出现规则的下标 "
+                        f"routes[{dup_index}]，实际 stderr={proc.stderr!r}",
+                    )
+                    self.assertIn(
+                        method, proc.stderr,
+                        f"样例 {label}: 标准错误应包含重复的方法 {method}，"
+                        f"实际 stderr={proc.stderr!r}",
+                    )
+                    self.assertIn(
+                        path, proc.stderr,
+                        f"样例 {label}: 标准错误应包含重复的路径 {path}，"
+                        f"实际 stderr={proc.stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER, proc.stdout,
+                        f"样例 {label}: 校验失败时标准输出不应出现监听提示，"
+                        f"实际 stdout={proc.stdout!r}",
+                    )
+
+
+class DistinctRouteTests(unittest.TestCase):
+    """合法对照：方法不同或路径字面不同的路由不应被唯一性检查误拒绝。"""
+
+    def _start_and_check(self, routes, expectations):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_distinct.json", routes)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                for label, method, target, expected_status, expected_body in (
+                    expectations
+                ):
+                    with self.subTest(sample=label):
+                        status, headers, raw = request(port, method, target)
+                        self.assertEqual(
+                            status, expected_status,
+                            f"样例 {label}: 状态码应为 {expected_status}，"
+                            f"实际 {status}",
+                        )
+                        self.assertEqual(
+                            headers.get("Content-Type"), CONTENT_TYPE,
+                            f"样例 {label}: Content-Type 应为 "
+                            f"{CONTENT_TYPE!r}",
+                        )
+                        self.assertEqual(
+                            int(headers["Content-Length"]), len(raw),
+                            f"样例 {label}: Content-Length 与实际字节数不符",
+                        )
+                        self.assertEqual(
+                            json.loads(raw.decode("utf-8")), expected_body,
+                            f"样例 {label}: 响应 JSON 应为 "
+                            f"{expected_body}，实际 {raw!r}",
+                        )
+            finally:
+                server.stop()
+
+    def test_same_path_different_methods_both_load(self):
+        # GET 与 POST 使用同一路径 /same，应同时加载并各自返回配置
+        routes = [
+            {"method": "GET", "path": "/same", "status": 200,
+             "body": {"via": "get"}},
+            {"method": "POST", "path": "/same", "status": 503,
+             "body": {"via": "post"}},
+        ]
+        self._start_and_check(
+            routes,
+            [
+                ("GET /same", "GET", "/same", 200, {"via": "get"}),
+                ("POST /same", "POST", "/same", 503, {"via": "post"}),
+            ],
+        )
+
+    def test_similar_paths_not_merged(self):
+        # /same、/Same、/same/、/s%61me 是四条不同路由：
+        # 不做大小写折叠、尾斜杠合并或百分号解码
+        routes = [
+            {"method": "GET", "path": "/same", "status": 200,
+             "body": {"path": "/same"}},
+            {"method": "GET", "path": "/Same", "status": 400,
+             "body": {"path": "/Same"}},
+            {"method": "GET", "path": "/same/", "status": 500,
+             "body": {"path": "/same/"}},
+            {"method": "GET", "path": "/s%61me", "status": 599,
+             "body": {"path": "/s%61me"}},
+        ]
+        self._start_and_check(
+            routes,
+            [
+                ("GET /same", "GET", "/same", 200, {"path": "/same"}),
+                ("GET /Same（大小写不折叠）", "GET", "/Same",
+                 400, {"path": "/Same"}),
+                ("GET /same/（尾斜杠不合并）", "GET", "/same/",
+                 500, {"path": "/same/"}),
+                ("GET /s%61me（百分号不解码）", "GET", "/s%61me",
+                 599, {"path": "/s%61me"}),
+            ],
+        )
+
+
 INVALID_STATUSES = [
     ("整数 199（低于下限）", 199),
     ("整数 201（2xx 仅接受 200）", 201),
