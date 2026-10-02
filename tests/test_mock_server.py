@@ -726,5 +726,195 @@ class LegalStringAndNumberTests(unittest.TestCase):
                 server.stop()
 
 
+# 语法合法但解析后得到 inf/-inf 的数字：parse_constant 钩子不会触发
+OVERFLOW_LITERALS = ["1e400", "-1e400", "1E+400", "-1E400", "1e999"]
+
+
+def overflow_rules_templates(literal):
+    """同一溢出数字出现在规则不同位置时的原始文本。
+
+    json.dumps 无法产出这样的文本（Python 端已是 inf，会被序列化成
+    非标准的 Infinity），因此一律手写 JSON 文本，并用普通拼接插入字面量，
+    避免 f-string 中大量花括号转义出错。
+    """
+    return {
+        "body 顶层字段": (
+            '{"routes":[{"method":"GET","path":"/value",'
+            '"body":{"n":' + literal + '}}]}'
+        ),
+        "body 嵌套对象中": (
+            '{"routes":[{"method":"GET","path":"/value",'
+            '"body":{"outer":{"n":' + literal + "}}}]}"
+        ),
+        "body 嵌套数组中": (
+            '{"routes":[{"method":"GET","path":"/value",'
+            '"body":{"list":[1,[2,{"v":' + literal + '}]]}}]}'
+        ),
+        "body 本身即为溢出数字": (
+            '{"routes":[{"method":"GET","path":"/value",'
+            '"body":' + literal + '}]}'
+        ),
+        "被忽略的额外字段中": (
+            '{"routes":[{"method":"GET","path":"/ok","body":{}}],'
+            '"extra":{"note":' + literal + '}}'
+        ),
+        "合法路由之后的溢出路由（不得部分启动）": (
+            '{"routes":['
+            '{"method":"GET","path":"/ok","body":{"ok":true}},'
+            '{"method":"GET","path":"/value","body":{"n":' + literal + '}}]}'
+        ),
+    }
+
+
+class OverflowNumberRejectionTests(unittest.TestCase):
+    """1e400 等溢出数字：启动阶段必须令整份规则加载失败。"""
+
+    def test_load_rules_raises_rules_error(self):
+        import math
+
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            # 确认前提：这些字面量确实会被默认浮点解析为非有限值，
+            # 且 parse_constant 钩子无法拦截
+            for literal in OVERFLOW_LITERALS:
+                self.assertFalse(math.isfinite(json.loads(literal)))
+
+            for literal in OVERFLOW_LITERALS:
+                for label, text in overflow_rules_templates(literal).items():
+                    with self.subTest(literal=literal, 位置=label):
+                        rules_path = write_rules_text(
+                            tmp, f"rules_of_{label}.json", text
+                        )
+                        with self.assertRaises(
+                            RulesError,
+                            msg=f"{label} 中的 {literal} 应使 load_rules "
+                                f"抛出 RulesError",
+                        ) as ctx:
+                            load_rules(rules_path)
+                        self.assertIn(
+                            "non-finite number", str(ctx.exception),
+                            f"{label} 中的 {literal}: 错误消息应包含 "
+                            f"'non-finite number'，实际消息={ctx.exception}",
+                        )
+
+    def test_cli_rejects_overflow_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for literal in OVERFLOW_LITERALS:
+                for label, text in overflow_rules_templates(literal).items():
+                    with self.subTest(literal=literal, 位置=label):
+                        rules_path = write_rules_text(
+                            tmp, f"rules_cli_of_{label}.json", text
+                        )
+                        returncode, stdout, stderr = start_and_wait_exit(
+                            rules_path, free_port()
+                        )
+                        self.assertEqual(
+                            returncode, 2,
+                            f"{label} 中的 {literal}: 期望退出码 2，实际 "
+                            f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            "non-finite number", stderr,
+                            f"{label} 中的 {literal}: 标准错误应包含 "
+                            f"'non-finite number'，实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            "Traceback", stderr,
+                            f"{label} 中的 {literal}: 不应出现 Python 异常回溯，"
+                            f"实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            STARTUP_MARKER, stdout,
+                            f"{label} 中的 {literal}: 标准输出不应出现监听提示，"
+                            f"实际 stdout={stdout!r}",
+                        )
+
+    def test_port_reusable_after_overflow_rejection(self):
+        # 含合法路由 + 溢出路由的规则必须整体失败：不监听端口、不部分启动；
+        # 同一端口随后启动合法规则应成功
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            bad_path = write_rules_text(
+                tmp, "rules_overflow_mixed.json",
+                '{"routes":['
+                '{"method":"GET","path":"/ok","body":{"ok":true}},'
+                '{"method":"GET","path":"/value","body":{"n":1e400}}]}',
+            )
+            good_path = write_rules(
+                tmp, "rules_good.json",
+                [{"method": "GET", "path": "/value", "body": {"ok": True}}],
+            )
+            port = free_port()
+            returncode, stdout, stderr = start_and_wait_exit(bad_path, port)
+            self.assertEqual(returncode, 2)
+            self.assertIn("non-finite number", stderr)
+            self.assertNotIn(STARTUP_MARKER, stdout)
+
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+            finally:
+                server.stop()
+
+
+class FiniteNumberControlTests(unittest.TestCase):
+    """有限值对照：1e308、下溢为 0.0 的 1e-400 及字符串/null 保持原语义。"""
+
+    BODY = {
+        "n": 1e308,
+        "tiny": 1e-400,
+        "text": "1e400",
+        "empty": None,
+        "s_inf": "Infinity",
+        "NaN": 1,
+        "int": 42,
+    }
+
+    def test_finite_large_and_underflow_numbers_served(self):
+        import math
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_finite.json",
+                [{"method": "GET", "path": "/value", "body": self.BODY}],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/value")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+
+                actual = json.loads(raw.decode("utf-8"))
+                # n 仍为有限数且数值不丢失
+                self.assertTrue(
+                    math.isfinite(actual["n"]),
+                    f"n 应为有限数，实际 {actual['n']!r}",
+                )
+                self.assertEqual(actual["n"], 1e308)
+                # 1e-400 按现有浮点语义下溢为 0.0
+                self.assertEqual(actual["tiny"], 0.0)
+                # 字符串内容不参与数字检查；null 原样保留
+                self.assertEqual(actual["text"], "1e400")
+                self.assertIsNone(actual["empty"])
+                # Infinity 字符串、NaN 对象键、整数按原语义返回
+                self.assertEqual(actual["s_inf"], "Infinity")
+                self.assertEqual(actual["NaN"], 1)
+                self.assertEqual(actual["int"], 42)
+
+                # 字节级核对：紧凑 UTF-8 JSON 与 Content-Length 均不变
+                expected_raw = json.dumps(
+                    self.BODY, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                self.assertEqual(raw, expected_raw)
+                self.assertEqual(
+                    int(headers["Content-Length"]), len(expected_raw)
+                )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

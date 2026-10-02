@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -42,6 +43,21 @@ def _reject_constant(value):
     raise ValueError(f"invalid JSON literal {value}")
 
 
+def _ensure_finite_numbers(value, where="$"):
+    # parse_constant 拦不住 1e400 这类语法合法但溢出的数字：它们会被默认
+    # 解析成 inf/-inf，随后 json.dumps 又会产出非标准的 Infinity 字面量。
+    # 因此解析后递归遍历整份文档（含会被忽略的额外字段），拒绝一切非有限浮点。
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise RulesError(f"non-finite number at {where}")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _ensure_finite_numbers(item, f"{where}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _ensure_finite_numbers(item, f"{where}[{index}]")
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 {(method, path): (状态码, 响应字节)} 字典。"""
     try:
@@ -58,6 +74,10 @@ def load_rules(path):
     except ValueError as exc:
         # JSONDecodeError 与非标准字面量（ValueError）统一归为 JSON 格式错误
         raise RulesError(f"rules file {path!r} is not valid JSON: {exc}")
+
+    # 1e400 等溢出数字语法合法，parse_constant 不会被调用；需在结构校验前
+    # 遍历整份文档（含额外字段），发现 inf/-inf/NaN 即拒绝整份规则
+    _ensure_finite_numbers(data)
 
     if not isinstance(data, dict) or not isinstance(data.get("routes"), list):
         raise RulesError("rules file must be a JSON object with a 'routes' array")

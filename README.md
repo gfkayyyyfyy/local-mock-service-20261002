@@ -83,6 +83,7 @@ python3 tests/test_mock_server.py
 - 规则文件不存在或不可读
 - 文件不是合法 UTF-8
 - JSON 语法错误
+- JSON 中出现非标准数字字面量（`NaN`、`Infinity`、`-Infinity`），或数字解析为非有限值（如 `1e400` 溢出为 `Infinity`；字符串 `"Infinity"` 不受影响）
 - 规则结构非法（顶层非对象、缺少 `routes` 数组等）
 - 路由项缺少必填字段、`method` 或 `path` 非法、`status` 非法、规则重复
 - 端口被占用
