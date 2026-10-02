@@ -1125,5 +1125,238 @@ class LegalUnicodeBodyTests(unittest.TestCase):
                 server.stop()
 
 
+def write_json_document(directory, name, document):
+    """将任意 JSON 值写为语法合法的 UTF-8 JSON 文件。
+
+    用于结构非法但语法合法的样例（如顶层为数组、routes 为 null），
+    避免把结构错误混同于编码或 JSON 语法错误。
+    """
+    path = Path(directory) / name
+    path.write_bytes(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+    return path
+
+
+# (说明, 规则文档（语法合法的 JSON）, 错误中必须出现的定位片段, 缺失字段名或 None)
+STRUCTURE_ERROR_CASES = [
+    # 顶层结构：错误消息均应指向 routes
+    ("顶层为数组", [], "routes", None),
+    ("顶层为 null", None, "routes", None),
+    ("对象缺少 routes", {}, "routes", None),
+    ("routes 为对象", {"routes": {}}, "routes", None),
+    ("routes 为 null", {"routes": None}, "routes", None),
+    # routes 数组中的非对象项：消息标明 routes[i]（下标从零开始）
+    ("routes[0] 为 null", {"routes": [None]}, "routes[0]", None),
+    ("routes[0] 为字符串", {"routes": ["not-an-object"]}, "routes[0]", None),
+    ("routes[0] 为数组", {"routes": [[]]}, "routes[0]", None),
+    # 非法项位于合法路由之后：必须整份失败，不返回部分路由
+    (
+        "合法路由后的 routes[1] 为 null",
+        {
+            "routes": [
+                {"method": "GET", "path": "/ok", "body": {"ok": True}},
+                None,
+            ]
+        },
+        "routes[1]", None,
+    ),
+    # 路由对象分别仅缺少一个必填字段，其余字段合法
+    (
+        "routes[0] 缺少 method",
+        {"routes": [{"path": "/x", "body": {}}]},
+        "routes[0]", "method",
+    ),
+    (
+        "routes[0] 缺少 path",
+        {"routes": [{"method": "GET", "body": {}}]},
+        "routes[0]", "path",
+    ),
+    (
+        "routes[0] 缺少 body",
+        {"routes": [{"method": "GET", "path": "/x"}]},
+        "routes[0]", "body",
+    ),
+    # 合法路由之后的项缺少字段：定位到实际下标且整份失败
+    (
+        "合法路由后的 routes[1] 缺少 body",
+        {
+            "routes": [
+                {"method": "GET", "path": "/ok", "body": {"ok": True}},
+                {"method": "GET", "path": "/bad"},
+            ]
+        },
+        "routes[1]", "body",
+    ),
+]
+
+
+class RulesStructureValidationTests(unittest.TestCase):
+    """规则结构校验：顶层结构、routes 元素与必填字段非法时整份加载失败。
+
+    所有样例都是语法合法的 UTF-8 JSON，错误仅来自结构本身。
+    """
+
+    def test_load_rules_rejects_invalid_structure(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, document, location, field) in enumerate(
+                STRUCTURE_ERROR_CASES
+            ):
+                with self.subTest(case=label):
+                    rules_path = write_json_document(
+                        tmp, f"rules_struct_{index}.json", document
+                    )
+                    # load_rules 必须抛出而非返回映射：
+                    # 即使非法项之前存在合法路由，也不返回部分路由
+                    with self.assertRaises(
+                        RulesError,
+                        msg=f"样例 {label!r} 应使 load_rules 抛出 RulesError",
+                    ) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn(
+                        location, message,
+                        f"样例 {label!r}: 错误消息应包含定位片段 {location!r}，"
+                        f"实际消息={message!r}",
+                    )
+                    if field is not None:
+                        self.assertIn(
+                            field, message,
+                            f"样例 {label!r}: 错误消息应标明缺失字段 {field!r}，"
+                            f"实际消息={message!r}",
+                        )
+
+    def test_cli_rejects_invalid_structure_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, document, location, field) in enumerate(
+                STRUCTURE_ERROR_CASES
+            ):
+                with self.subTest(case=label):
+                    rules_path = write_json_document(
+                        tmp, f"rules_struct_cli_{index}.json", document
+                    )
+                    # start_and_wait_exit 在 10 秒内未收到退出即判失败，
+                    # 并负责回收子进程与管道
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label!r}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        location, stderr,
+                        f"样例 {label!r}: 标准错误应包含定位片段 {location!r}，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    if field is not None:
+                        self.assertIn(
+                            field, stderr,
+                            f"样例 {label!r}: 标准错误应标明缺失字段 "
+                            f"{field!r}，实际 stderr={stderr!r}",
+                        )
+                    self.assertNotIn(
+                        "Traceback", stderr,
+                        f"样例 {label!r}: 不应出现 Python 异常回溯，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER, stdout,
+                        f"样例 {label!r}: 校验失败时标准输出不应出现监听提示，"
+                        f"实际 stdout={stdout!r}",
+                    )
+
+
+class ValidStructureControlTests(unittest.TestCase):
+    """合法结构对照：空 routes、显式 null body 与额外字段保持既有语义。"""
+
+    def test_empty_routes_loads_as_empty_mapping(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_json_document(
+                tmp, "rules_empty.json", {"routes": []}
+            )
+            routes = load_rules(rules_path)
+            self.assertEqual(
+                routes, {},
+                f"{{\"routes\":[]}} 应加载为空映射，实际 {routes!r}",
+            )
+
+    def test_explicit_null_body_keeps_default_200_and_null_bytes(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_null_body.json",
+                [{"method": "GET", "path": "/nil", "body": None}],
+            )
+            # 入口一：load_rules 中 status 缺省为 200，body 序列化为字节 null
+            routes = load_rules(rules_path)
+            self.assertEqual(
+                routes.get(("GET", "/nil")), (200, b"null"),
+                f"显式 null body 应保留默认 200 与响应字节 b'null'，"
+                f"实际 {routes.get(('GET', '/nil'))!r}",
+            )
+
+            # 入口二：经命令行启动核对实际 HTTP 响应
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/nil")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(
+                    raw, b"null",
+                    f"响应体字节应为 b'null'，实际 {raw!r}",
+                )
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                self.assertIsNone(json.loads(raw.decode("utf-8")))
+            finally:
+                server.stop()
+
+    def test_extra_fields_ignored_without_affecting_result(self):
+        from mock_server import load_rules
+
+        document = {
+            "routes": [
+                # 路由项中的普通额外字段被忽略
+                {"method": "GET", "path": "/x", "body": {"ok": True},
+                 "extra": "ignored", "verbose": False},
+                {"method": "POST", "path": "/y", "body": None,
+                 "note": ["any", "value"]},
+            ],
+            # 顶层额外字段同样被忽略
+            "version": 99,
+            "top_extra": {"nested": [1, 2, 3]},
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_json_document(
+                tmp, "rules_extra_fields.json", document
+            )
+            routes = load_rules(rules_path)
+            self.assertEqual(
+                set(routes), {("GET", "/x"), ("POST", "/y")},
+                f"额外字段不得影响加载出的路由集合，实际 {set(routes)!r}",
+            )
+            self.assertEqual(routes[("GET", "/x")], (200, b'{"ok":true}'))
+            self.assertEqual(routes[("POST", "/y")], (200, b"null"))
+
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, _headers, raw = request(port, "GET", "/x")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+
+                status, _headers, raw = request(port, "POST", "/y")
+                self.assertEqual(status, 200)
+                self.assertEqual(raw, b"null")
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
