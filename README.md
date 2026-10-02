@@ -30,14 +30,15 @@ UTF-8 编码的 JSON，顶层为对象，含 `routes` 数组；每项为含 `met
 - `method`：仅接受大写 `"GET"` 或 `"POST"`。
 - `path`：以 `/` 开头、不含 `?` 和 `#` 的字符串。
 - `body`：任意 JSON 值（包括 `null`），命中时作为响应体返回。
-- `routes` 可以为空数组；路由项中的额外字段会被忽略。
+- `status`：可选，缺省为 `200`；仅接受整数 `200` 或 `400`–`599`（包含两端）。布尔值、`null`、字符串、浮点数（含 `503.0`）、数组、对象均非法。错误状态同样返回配置的 `body`，不替换为统一错误对象。
+- `routes` 可以为空数组；路由项中除 `status` 外的额外字段会被忽略。
 - 不允许重复的 `method` + `path` 组合。
 
 ## 请求匹配与响应
 
 - 匹配时忽略查询字符串和请求体；路径的大小写、尾部斜杠、百分号转义按原样比较。
-- `GET` / `POST` 命中：返回 HTTP 200 及配置的 `body`。
-- 未命中：返回 HTTP 404 及 `{"error":"route_not_found"}`。
+- `GET` / `POST` 命中：返回配置的 `status`（缺省 200）及配置的 `body`。
+- 未命中：返回 HTTP 404 及 `{"error":"route_not_found"}`（即使某条已命中路由自身配置了 404，也按命中处理并返回其 `body`）。
 - 其他 HTTP 方法不予处理（返回 501）。
 - 所有响应均为 UTF-8 JSON，`Content-Type: application/json; charset=utf-8`，`Content-Length` 为实际字节数。
 
@@ -69,5 +70,5 @@ Content-Length: 27
 - 文件不是合法 UTF-8
 - JSON 语法错误
 - 规则结构非法（顶层非对象、缺少 `routes` 数组等）
-- 路由项缺少必填字段、`method` 或 `path` 非法、规则重复
+- 路由项缺少必填字段、`method` 或 `path` 非法、`status` 非法、规则重复
 - 端口被占用

@@ -29,8 +29,15 @@ def _port(value):
     return port
 
 
+def _valid_status(value):
+    # bool 是 int 的子类，需显式排除；503.0 等浮点数也不接受
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return value == 200 or 400 <= value <= 599
+
+
 def load_rules(path):
-    """加载并校验规则文件，返回 {(method, path): 响应字节} 字典。"""
+    """加载并校验规则文件，返回 {(method, path): (状态码, 响应字节)} 字典。"""
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -75,9 +82,16 @@ def load_rules(path):
         key = (method, route_path)
         if key in routes:
             raise RulesError(f"{where}: duplicate route {method} {route_path}")
-        routes[key] = json.dumps(
+        status = item.get("status", 200)
+        if not _valid_status(status):
+            raise RulesError(
+                f"{where}: status must be the integer 200 or an integer "
+                f"between 400 and 599, got {status!r}"
+            )
+        body = json.dumps(
             item["body"], ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
+        routes[key] = (status, body)
     return routes
 
 
@@ -100,11 +114,11 @@ def _make_handler(routes):
         def _respond(self):
             self._discard_body()
             path = urlsplit(self.path).path
-            body = routes.get((self.command, path))
-            if body is None:
+            entry = routes.get((self.command, path))
+            if entry is None:
                 self._send(404, NOT_FOUND_BODY)
             else:
-                self._send(200, body)
+                self._send(entry[0], entry[1])
 
         def _send(self, status, body):
             self.send_response(status)
