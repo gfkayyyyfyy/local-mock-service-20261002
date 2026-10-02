@@ -61,6 +61,20 @@ Content-Length: 27
 {"error":"route_not_found"}
 ```
 
+## 测试
+
+回归测试仅依赖 Python 3 标准库，会自行准备临时 UTF-8 规则文件与可用端口，通过 `python -m mock_server` 子进程在 `127.0.0.1` 上发起真实 HTTP 请求，结束后自动释放进程、连接与临时文件，不修改 `rules.json`。在项目根目录执行：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+也可以直接运行：
+
+```bash
+python3 tests/test_mock_server.py
+```
+
 ## 错误处理
 
 以下情况均向标准错误输出原因并以退出码 2 结束，不接收请求：
