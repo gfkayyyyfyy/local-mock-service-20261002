@@ -42,6 +42,20 @@ UTF-8 编码的 JSON，顶层为对象，含 `routes` 数组；每项为含 `met
 - 其他 HTTP 方法不予处理（返回 501）。
 - 所有响应均为 UTF-8 JSON，`Content-Type: application/json; charset=utf-8`，`Content-Length` 为实际字节数。
 
+## 测试
+
+回归测试仅依赖 Python 3 标准库，会自行准备临时规则文件和可用端口，
+只连接 `127.0.0.1`，不修改 `rules.json`。在项目根目录执行：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+也可直接运行 `python tests/test_mock_server.py`。测试覆盖：命中路由的状态码、
+响应体、`Content-Type`/`Content-Length` 与中文 UTF-8 解析；配置的 404 与未命中
+404 的区分；合法 status 边界 200/400/599；以及各类非法 status 以退出码 2 报错
+且不输出监听提示。
+
 ## 示例
 
 ```bash
