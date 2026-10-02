@@ -346,5 +346,230 @@ class InvalidStatusTests(unittest.TestCase):
                     )
 
 
+DUPLICATE_ROUTE_CASES = [
+    # (说明, routes, 后出现规则的下标, 重复方法, 重复路径)
+    (
+        "相邻重复：body 与 status 均不同",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "GET", "path": "/same", "status": 503, "body": 2},
+        ],
+        1, "GET", "/same",
+    ),
+    (
+        "非相邻重复：中间夹一条合法且不同的路由",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "POST", "path": "/other", "body": {"ok": True}},
+            {"method": "GET", "path": "/same", "status": 503, "body": 2},
+        ],
+        2, "GET", "/same",
+    ),
+    (
+        "相邻重复：body 与 status 完全相同",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "GET", "path": "/same", "body": 1},
+        ],
+        1, "GET", "/same",
+    ),
+    (
+        "相邻重复：仅 body 不同（status 同为缺省 200）",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "GET", "path": "/same", "body": 2},
+        ],
+        1, "GET", "/same",
+    ),
+    (
+        "相邻重复：仅 status 不同（body 相同）",
+        [
+            {"method": "GET", "path": "/same", "body": 1},
+            {"method": "GET", "path": "/same", "status": 503, "body": 1},
+        ],
+        1, "GET", "/same",
+    ),
+    (
+        "POST 相邻重复：body 与 status 均不同",
+        [
+            {"method": "POST", "path": "/same", "body": {"kind": "first"}},
+            {"method": "POST", "path": "/same", "status": 500,
+             "body": {"kind": "second"}},
+        ],
+        1, "POST", "/same",
+    ),
+    (
+        "POST 非相邻重复：中间夹一条合法且不同的 GET 路由",
+        [
+            {"method": "POST", "path": "/same", "body": {"kind": "first"}},
+            {"method": "GET", "path": "/other", "body": {"ok": True}},
+            {"method": "POST", "path": "/same", "status": 500,
+             "body": {"kind": "second"}},
+        ],
+        2, "POST", "/same",
+    ),
+]
+
+
+def start_and_wait_exit(rules_path, port):
+    """经公开启动入口启动子进程并等待其自行退出。
+
+    返回 (returncode, stdout, stderr)。在 STARTUP_TIMEOUT 内未退出则杀掉
+    进程并抛出 AssertionError（判失败，而非跳过）。无论正常返回还是超时，
+    返回前都回收子进程与管道。
+    """
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "mock_server",
+            "--rules", str(rules_path),
+            "--port", str(port),
+        ],
+        cwd=str(PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        while True:
+            returncode = proc.poll()
+            if returncode is not None:
+                stdout, stderr = proc.communicate(timeout=5)
+                return returncode, stdout, stderr
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"mock_server 在 {STARTUP_TIMEOUT}s 内未退出，"
+                    f"疑似启动期唯一性检查未生效（pid={proc.pid}）"
+                )
+            time.sleep(0.05)
+    finally:
+        # 超时分支下进程可能仍在运行：确保杀掉并回收，避免残留进程
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+
+
+class DuplicateRouteTests(unittest.TestCase):
+    """启动期 method + path 唯一性检查：重复规则必须令启动失败。"""
+
+    def test_duplicate_routes_rejected_at_startup(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, routes, later_index, method, path) in enumerate(
+                DUPLICATE_ROUTE_CASES
+            ):
+                with self.subTest(case=label):
+                    rules_path = write_rules(
+                        tmp, f"rules_dup_{index}.json", routes
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label!r}: 期望退出码 2，实际 "
+                        f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    # 不逐字比较整段消息，只定位关键片段
+                    self.assertIn(
+                        "duplicate route", stderr,
+                        f"样例 {label!r}: 标准错误应包含 'duplicate route'，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        method, stderr,
+                        f"样例 {label!r}: 标准错误应标明重复的方法 {method!r}，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        path, stderr,
+                        f"样例 {label!r}: 标准错误应标明重复的路径 {path!r}，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        f"routes[{later_index}]", stderr,
+                        f"样例 {label!r}: 标准错误应标明后出现规则的下标 "
+                        f"routes[{later_index}]，实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER, stdout,
+                        f"样例 {label!r}: 校验失败时标准输出不应出现监听提示，"
+                        f"实际 stdout={stdout!r}",
+                    )
+
+
+class DistinctRouteTests(unittest.TestCase):
+    """合法对照：唯一性检查不得误拒绝本不相同的路由。"""
+
+    def test_same_path_different_methods_both_load(self):
+        # GET 与 POST 共用同一路径是两条不同路由
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            routes = [
+                {"method": "GET", "path": "/same",
+                 "body": {"method": "GET"}},
+                {"method": "POST", "path": "/same", "status": 503,
+                 "body": {"method": "POST"}},
+            ]
+            rules_path = write_rules(tmp, "rules_methods.json", routes)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/same")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"method": "GET"})
+
+                status, headers, raw = request(port, "POST", "/same")
+                self.assertEqual(status, 503)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"method": "POST"})
+            finally:
+                server.stop()
+
+    def test_path_literal_variants_loaded_as_distinct(self):
+        # 不做大小写折叠、尾斜杠合并或百分号解码：四条 GET 路径互不相同
+        variants = [
+            ("/same", 200, {"v": "plain"}),
+            ("/Same", 400, {"v": "capitalized"}),
+            ("/same/", 503, {"v": "trailing_slash"}),
+            ("/s%61me", 500, {"v": "percent_encoded"}),
+        ]
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            routes = [
+                {"method": "GET", "path": path, "status": status, "body": body}
+                for path, status, body in variants
+            ]
+            rules_path = write_rules(tmp, "_rules_literal_paths.json", routes)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                for path, status, body in variants:
+                    with self.subTest(path=path):
+                        code, headers, raw = request(port, "GET", path)
+                        self.assertEqual(
+                            code, status,
+                            f"GET {path}: 状态码应为 {status}，实际 {code}",
+                        )
+                        self.assertEqual(
+                            headers.get("Content-Type"), CONTENT_TYPE
+                        )
+                        self.assertEqual(
+                            int(headers["Content-Length"]), len(raw)
+                        )
+                        self.assertEqual(
+                            json.loads(raw.decode("utf-8")), body,
+                            f"GET {path}: 各路径必须独立返回各自配置的响应",
+                        )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
