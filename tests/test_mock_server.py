@@ -1435,5 +1435,201 @@ class ValidStructureControlTests(unittest.TestCase):
                 server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 启动期 path 校验回归
+#
+# 下列非法 path 样例均由 json.dumps 产出，规则文件是语法合法的 UTF-8 JSON，
+# 且路由项的 method/body 均合法，因此失败只能归因于 path 校验本身。
+# ---------------------------------------------------------------------------
+
+INVALID_PATHS = [
+    # (说明, 非法 path 值)：非字符串、缺前导斜杠、含 '?' 或 '#'
+    ("null", None),
+    ("布尔 true", True),
+    ("整数 123", 123),
+    ("浮点数 1.5", 1.5),
+    ("空数组 []", []),
+    ("空对象 {}", {}),
+    ("空字符串", ""),
+    ("缺少前导斜杠 hello", "hello"),
+    ("缺少前导斜杠 hello/x", "hello/x"),
+    ("含问号 /hello?x=1", "/hello?x=1"),
+    ("含井号 /hello#part", "/hello#part"),
+]
+
+
+def invalid_path_route_sets(bad_path):
+    """同一非法 path 分别放在 routes[0] 与合法路由之后的 routes[1]。
+
+    返回 [(位置说明, routes, 非法项下标)]；除 path 外其余字段均合法，
+    每份文件只含一个非法项。
+    """
+    return [
+        (
+            "routes[0]",
+            [{"method": "GET", "path": bad_path, "body": {}}],
+            0,
+        ),
+        (
+            "合法路由之后的 routes[1]",
+            [
+                {"method": "GET", "path": "/ok", "body": {"fine": 1}},
+                {"method": "GET", "path": bad_path, "body": {}},
+            ],
+            1,
+        ),
+    ]
+
+
+class InvalidPathTests(unittest.TestCase):
+    """非法 path：load_rules 抛 RulesError，CLI 退出码 2，均标明实际下标。"""
+
+    def test_load_rules_rejects_invalid_paths(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            case_no = 0
+            for label, bad_path in INVALID_PATHS:
+                for position, routes, bad_index in invalid_path_route_sets(
+                    bad_path
+                ):
+                    case_no += 1
+                    with self.subTest(样例=label, 位置=position):
+                        rules_path = write_rules(
+                            tmp, f"rules_badpath_{case_no}.json", routes
+                        )
+                        with self.assertRaises(
+                            RulesError,
+                            msg=f"样例 {label!r}（{position}）: load_rules "
+                                f"应抛出 RulesError，不得返回部分路由",
+                        ) as ctx:
+                            load_rules(rules_path)
+                        message = str(ctx.exception)
+                        self.assertIn(
+                            f"routes[{bad_index}]",
+                            message,
+                            f"样例 {label!r}（{position}）: 错误消息应标明实际"
+                            f"下标 routes[{bad_index}]，实际消息={message!r}",
+                        )
+                        self.assertIn(
+                            "path",
+                            message,
+                            f"样例 {label!r}（{position}）: 错误消息应指向 "
+                            f"path 字段，实际消息={message!r}",
+                        )
+
+    def test_cli_rejects_invalid_paths_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            case_no = 0
+            for label, bad_path in INVALID_PATHS:
+                for position, routes, bad_index in invalid_path_route_sets(
+                    bad_path
+                ):
+                    case_no += 1
+                    with self.subTest(样例=label, 位置=position):
+                        rules_path = write_rules(
+                            tmp, f"rules_badpath_cli_{case_no}.json", routes
+                        )
+                        # start_and_wait_exit 保证超时判失败并回收进程与管道
+                        returncode, stdout, stderr = start_and_wait_exit(
+                            rules_path, free_port()
+                        )
+                        self.assertEqual(
+                            returncode, 2,
+                            f"样例 {label!r}（{position}）: 期望退出码 2，实际 "
+                            f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            f"routes[{bad_index}]", stderr,
+                            f"样例 {label!r}（{position}）: 标准错误应标明实际"
+                            f"下标 routes[{bad_index}]，实际 stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            "path", stderr,
+                            f"样例 {label!r}（{position}）: 标准错误应指向 "
+                            f"path 字段，实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            "Traceback", stderr,
+                            f"样例 {label!r}（{position}）: 不应出现 Python "
+                            f"异常回溯，实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            STARTUP_MARKER, stdout,
+                            f"样例 {label!r}（{position}）: 校验失败时标准输出"
+                            f"不应出现监听提示，实际 stdout={stdout!r}",
+                        )
+
+    def test_port_reusable_after_path_failure(self):
+        # 拒绝加载不得留下监听服务：同一端口随后启动合法规则应成功响应
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            bad_path = write_rules(
+                tmp,
+                "rules_badpath_reuse.json",
+                [{"method": "GET", "path": "/hello?x=1", "body": {}}],
+            )
+            good_path = write_rules(
+                tmp,
+                "rules_badpath_good.json",
+                [{"method": "GET", "path": "/hello", "body": {"ok": True}}],
+            )
+            port = free_port()
+            returncode, stdout, stderr = start_and_wait_exit(bad_path, port)
+            self.assertEqual(returncode, 2)
+            self.assertIn("routes[0]", stderr)
+            self.assertIn("path", stderr)
+            self.assertNotIn(STARTUP_MARKER, stdout)
+
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/hello")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+            finally:
+                server.stop()
+
+
+class LegalRootPathControlTests(unittest.TestCase):
+    """合法对照：path 为 "/" 的根路径路由，两个入口均按既有行为工作。"""
+
+    ROUTES = [{"method": "GET", "path": "/", "body": {"message": "你好"}}]
+    EXPECTED_RAW = json.dumps(
+        {"message": "你好"}, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+    def test_load_rules_root_path_default_status_and_utf8_bytes(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_root.json", self.ROUTES)
+            routes = load_rules(rules_path)
+            # 根路径路由、缺省 status 200、配置对象的紧凑 UTF-8 响应字节
+            self.assertEqual(
+                routes, {("GET", "/"): (200, self.EXPECTED_RAW)}
+            )
+
+    def test_cli_root_path_ignores_query_string(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_root_cli.json", self.ROUTES)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                # 规则中的 '?' 被拒绝，而请求中的查询字符串被忽略：
+                # 带查询串请求根路径仍命中并返回配置的响应
+                status, headers, raw = request(port, "GET", "/?x=1")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(raw, self.EXPECTED_RAW)
+                self.assertEqual(
+                    int(headers["Content-Length"]), len(self.EXPECTED_RAW)
+                )
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"message": "你好"}
+                )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
