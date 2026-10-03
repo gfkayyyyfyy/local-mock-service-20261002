@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 ALLOWED_METHODS = ("GET", "POST")
 NOT_FOUND_BODY = b'{"error":"route_not_found"}'
+METHOD_NOT_SUPPORTED_BODY = b'{"error":"method_not_supported"}'
 CONTENT_TYPE = "application/json; charset=utf-8"
 
 
@@ -202,6 +203,30 @@ def _make_handler(routes):
 
         do_GET = _respond
         do_POST = _respond
+
+        def send_error(self, code, message=None, explain=None):
+            # 仅统一 501（方法不受支持）的公开格式；其余错误（如 400）
+            # 仍沿用标准库默认处理
+            if code == 501:
+                self._send_method_not_supported()
+            else:
+                super().send_error(code, message, explain)
+
+        def _send_method_not_supported(self):
+            # 非 GET/POST 方法：不查路由、不应用延迟、不读取请求体，
+            # 统一返回 JSON 拒绝并关闭连接（请求体剩余字节不会被当作
+            # 后续请求解释）。HEAD 不发送响应体，但 Content-Length 仍
+            # 按 JSON 正文的字节数给出。
+            self.send_response(501)
+            self.send_header("Content-Type", CONTENT_TYPE)
+            self.send_header(
+                "Content-Length", str(len(METHOD_NOT_SUPPORTED_BODY))
+            )
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(METHOD_NOT_SUPPORTED_BODY)
+            self.close_connection = True
 
         def log_message(self, format, *args):
             pass

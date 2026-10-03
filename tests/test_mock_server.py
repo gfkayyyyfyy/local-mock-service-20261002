@@ -2377,5 +2377,148 @@ class PartialRequestBodyDelayTests(unittest.TestCase):
             sock.close()
 
 
+# ---------------------------------------------------------------------------
+# 不支持方法的 501 JSON 拒绝响应回归
+#
+# 非 GET/POST 方法统一返回 501 与 {"error":"method_not_supported"}，
+# 不读取路由配置（body/status/delayMs 均不适用），响应携带
+# Connection: close 并在发送后关闭连接；HEAD 不发送响应体。
+# ---------------------------------------------------------------------------
+
+METHOD_REJECT_BODY = b'{"error":"method_not_supported"}'
+
+
+class MethodNotSupportedTests(unittest.TestCase):
+    """501 拒绝响应：统一 JSON 格式、关闭连接，与既有路由行为互不干扰。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        # GET /hello 配置 503 + 延迟 + 中文 body：501 不得使用其中任何一项
+        cls.rules_path = write_rules(
+            cls._tmp.name,
+            "rules_method_501.json",
+            [
+                {"method": "GET", "path": "/hello", "status": 503,
+                 "delayMs": DELAY_MS, "body": {"message": "你好"}},
+            ],
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _assert_501_headers(self, label, headers):
+        content_type = headers.get("Content-Type")
+        self.assertEqual(
+            content_type, CONTENT_TYPE,
+            f"样例 {label}: Content-Type 应为 {CONTENT_TYPE!r}，"
+            f"实际 {content_type!r}",
+        )
+        content_length = headers.get("Content-Length")
+        self.assertIsNotNone(content_length, f"样例 {label}: 缺少 Content-Length")
+        self.assertEqual(
+            int(content_length), len(METHOD_REJECT_BODY),
+            f"样例 {label}: Content-Length 应为拒绝正文的字节数 "
+            f"{len(METHOD_REJECT_BODY)}，实际 {content_length!r}",
+        )
+        connection = headers.get("Connection")
+        self.assertEqual(
+            connection, "close",
+            f"样例 {label}: 拒绝响应应携带 Connection: close，"
+            f"实际 {connection!r}",
+        )
+
+    def test_put_on_configured_route_returns_json_501(self):
+        # PUT /hello?x=1：命中路径存在且配置了 503/延迟/中文 body，
+        # 但 501 拒绝不得使用其中任何一项，也不应等待
+        status, headers, raw, elapsed = timed_request(
+            self.port, "PUT", "/hello?x=1"
+        )
+        self.assertEqual(status, 501)
+        self._assert_501_headers("PUT /hello?x=1", headers)
+        self.assertEqual(raw, METHOD_REJECT_BODY)
+        self.assertNotIn("你好".encode("utf-8"), raw)
+        self.assertLess(
+            elapsed, NO_DELAY_MAX_SECONDS,
+            f"PUT /hello?x=1: 501 拒绝不应应用路由延迟 {DELAY_MS}ms，"
+            f"实际耗时 {elapsed * 1000:.1f}ms",
+        )
+
+    def test_unsupported_methods_on_missing_path(self):
+        # 路径不存在时同样返回统一的 501（而非 404）
+        for method in ("PUT", "DELETE", "OPTIONS"):
+            with self.subTest(method=method):
+                status, headers, raw = request(self.port, method, "/missing")
+                self.assertEqual(status, 501)
+                self._assert_501_headers(f"{method} /missing", headers)
+                self.assertEqual(raw, METHOD_REJECT_BODY)
+
+    def test_head_returns_501_headers_without_body(self):
+        # HEAD：同样的 501 与响应头约定，Content-Length 仍按 JSON 正文
+        # 字节数给出，但不发送响应体
+        status, headers, raw = request(self.port, "HEAD", "/hello")
+        self.assertEqual(status, 501)
+        self._assert_501_headers("HEAD /hello", headers)
+        self.assertEqual(raw, b"")
+
+    def test_get_route_unaffected_after_rejections(self):
+        # 新连接上的 GET 仍按路由配置：等待延迟后返回 503 与中文 JSON
+        status, headers, raw, elapsed = timed_request(
+            self.port, "GET", "/hello"
+        )
+        self.assertGreaterEqual(
+            elapsed, DELAY_MIN_SECONDS,
+            f"GET /hello: 仍应等待配置的 {DELAY_MS}ms，"
+            f"实际 {elapsed * 1000:.1f}ms",
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, '{"message":"你好"}'.encode("utf-8"))
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_body_request_rejected_once_and_connection_closed(self):
+        # 携带请求体的 PUT 之后紧跟一个流水线 GET：只应得到一个 501，
+        # 请求体与其后的字节都不得被当作后续请求解释
+        request_bytes = (
+            "PUT /hello HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+        ).encode("ascii") + b"hello" + (
+            "GET /hello HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        sock = socket.create_connection(
+            ("127.0.0.1", self.port), timeout=REQUEST_TIMEOUT
+        )
+        try:
+            sock.sendall(request_bytes)
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    # 服务端在响应后关闭了连接
+                    break
+                chunks.append(chunk)
+        finally:
+            sock.close()
+        data = b"".join(chunks)
+        head, _, body = data.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        self.assertEqual(
+            status_line, b"HTTP/1.1 501 Not Implemented",
+            f"状态行应为 501，实际 {status_line!r}",
+        )
+        self.assertEqual(
+            data.count(b"HTTP/1.1"), 1,
+            f"流水线中的第二个请求不得被处理，实际响应 {data!r}",
+        )
+        self.assertEqual(body, METHOD_REJECT_BODY)
+        self.assertIn(b"Connection: close", head)
+        self.assertNotIn("你好".encode("utf-8"), data)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
