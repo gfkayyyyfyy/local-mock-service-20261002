@@ -1943,5 +1943,206 @@ class DelayBoundaryTests(unittest.TestCase):
                 server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 分段发送请求体时的延迟回归
+#
+# 规则约定请求体读取完毕后才开始延迟。下列用例用裸 socket 把 Content-Length
+# 合法的请求体拆成两段发送，分别核对“补齐前保持静默”与“补齐后重新计满延迟”
+# 两个观察结果，而不是只看整个请求的总耗时。
+# ---------------------------------------------------------------------------
+
+PARTIAL_DELAY_MS = 200
+PARTIAL_DELAY_SECONDS = PARTIAL_DELAY_MS / 1000
+# 补齐请求体后允许的计时误差上限（20ms）
+PARTIAL_TIMING_TOLERANCE = 0.02
+# 补齐前静默观察时长：大于 200ms 延迟，提前响应或拿接收耗时抵扣都会在此窗口暴露
+PARTIAL_PRE_WAIT_SECONDS = 0.30
+# 补齐后取得完整响应的硬上限：超时判失败，不得跳过或视为成功
+PARTIAL_RESPONSE_TIMEOUT = 5.0
+PARTIAL_RULES = [
+    {
+        "method": "POST",
+        "path": "/slow",
+        "delayMs": PARTIAL_DELAY_MS,
+        "status": 503,
+        "body": {"error": "demo_failure"},
+    }
+]
+
+
+class PartialRequestBodyDelayTests(unittest.TestCase):
+    """请求体分段到达时：读完之前不响应，读完之后延迟重新计满 200ms。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_delay_partial.json", PARTIAL_RULES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _wait_until_readable(self, selector, deadline):
+        """轮询等到 socket 可读返回 True，到达 deadline 仍不可读返回 False。"""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if selector.select(timeout=min(0.05, remaining)):
+                return True
+
+    def _recv_or_fail(self, sock, selector, deadline, phase):
+        """在 deadline 前读取一段响应字节；超时或连接关闭均判失败。"""
+        if not self._wait_until_readable(selector, deadline):
+            self.fail(
+                f"{phase}：补齐请求体后超过 "
+                f"{PARTIAL_RESPONSE_TIMEOUT:.0f} 秒仍未取得完整响应"
+            )
+        chunk = sock.recv(4096)
+        if not chunk:
+            self.fail(
+                f"{phase}:服务端关闭了连接，未取得完整的 HTTP 响应"
+            )
+        return chunk
+
+    def test_delay_starts_only_after_entire_request_body_read(self):
+        # POST /slow?x=1，Content-Length: 6，请求体 abcdef 分两段发送：
+        # 先发请求头与 "abc"，连接保持打开；300ms 静默后再补发 "def"。
+        # 查询字符串与请求体内容都不改变该路由的配置响应。
+        request_head = (
+            "POST /slow?x=1 HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "Content-Length: 6\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        sock = socket.create_connection(
+            ("127.0.0.1", self.port), timeout=REQUEST_TIMEOUT
+        )
+        # 禁用 Nagle，保证两段请求体各自立即发出
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        selector = DefaultSelector()
+        selector.register(sock, EVENT_READ)
+        try:
+            # ---- 阶段一（补齐前）：只发送请求头与前 3 字节请求体 ----
+            sock.sendall(request_head + b"abc")
+            silence_start = time.monotonic()
+            silence_deadline = silence_start + PARTIAL_PRE_WAIT_SECONDS
+            while time.monotonic() < silence_deadline:
+                if self._wait_until_readable(selector, silence_deadline):
+                    chunk = sock.recv(4096)
+                    waited_ms = (time.monotonic() - silence_start) * 1000
+                    if not chunk:
+                        self.fail(
+                            "补齐请求体之前（阶段一）：仅发送 3/6 字节请求体，"
+                            f"服务端在 {waited_ms:.1f}ms 后关闭了连接；"
+                            "请求体尚未读完时既不应返回，也不应结束请求"
+                        )
+                    self.fail(
+                        "补齐请求体之前（阶段一）：仅发送 3/6 字节请求体并保持"
+                        f"连接 {waited_ms:.1f}ms 后就收到 {len(chunk)} 个响应"
+                        f"字节：{chunk[:120]!r}；请求体读完前不得返回响应，"
+                        "接收请求体的耗时也不得抵扣配置的延迟"
+                    )
+
+            # ---- 阶段二（补齐后）：补发剩余 3 字节，延迟从此刻起算 ----
+            completion = time.monotonic()
+            sock.sendall(b"def")
+            response_deadline = completion + PARTIAL_RESPONSE_TIMEOUT
+
+            if not self._wait_until_readable(selector, response_deadline):
+                self.fail(
+                    "补齐请求体之后（阶段二）：发送剩余请求体后超过 "
+                    f"{PARTIAL_RESPONSE_TIMEOUT:.0f} 秒仍未收到任何响应字节"
+                )
+            first_byte_at = time.monotonic()
+            first_chunk = sock.recv(4096)
+            wait_before_first = first_byte_at - completion
+            if not first_chunk:
+                self.fail(
+                    "补齐请求体之后（阶段二）：服务端在补齐请求体后关闭了"
+                    f"连接（等待 {wait_before_first * 1000:.1f}ms），"
+                    "未返回任何响应"
+                )
+            self.assertGreaterEqual(
+                wait_before_first,
+                PARTIAL_DELAY_SECONDS - PARTIAL_TIMING_TOLERANCE,
+                "补齐请求体之后（阶段二）：从补齐请求体到首个响应字节仅 "
+                f"{wait_before_first * 1000:.1f}ms，早于配置的 "
+                f"{PARTIAL_DELAY_MS}ms（计时误差容忍 "
+                f"{PARTIAL_TIMING_TOLERANCE * 1000:.0f}ms）；"
+                "延迟必须在请求体读完后重新计满，不得与接收请求体的耗时重叠",
+            )
+
+            # 在同一 5 秒上限内收齐响应头与响应体，逐段解析
+            buffer = first_chunk
+            while b"\r\n\r\n" not in buffer:
+                buffer += self._recv_or_fail(
+                    sock, selector, response_deadline,
+                    "补齐请求体之后（阶段二：读取响应头）",
+                )
+            head_bytes, _, body_bytes = buffer.partition(b"\r\n\r\n")
+            head_lines = head_bytes.split(b"\r\n")
+            status_parts = head_lines[0].split(b" ", 2)
+            self.assertEqual(
+                len(status_parts), 3,
+                f"补齐请求体之后（阶段二）：状态行格式非法，实际 "
+                f"{head_lines[0]!r}",
+            )
+            self.assertEqual(
+                status_parts[0], b"HTTP/1.1",
+                f"补齐请求体之后（阶段二）：应返回 HTTP/1.1 响应，实际状态行 "
+                f"{head_lines[0]!r}",
+            )
+            self.assertEqual(
+                status_parts[1], b"503",
+                f"补齐请求体之后（阶段二）：状态码应为 503，实际状态行 "
+                f"{head_lines[0]!r}",
+            )
+            headers = {}
+            for line in head_lines[1:]:
+                name, sep, value = line.partition(b":")
+                if sep:
+                    headers[name.strip().decode("ascii").lower()] = (
+                        value.strip().decode("ascii")
+                    )
+
+            content_type = headers.get("content-type")
+            self.assertEqual(
+                content_type, CONTENT_TYPE,
+                "补齐请求体之后（阶段二）：Content-Type 应为 "
+                f"{CONTENT_TYPE!r}，实际 {content_type!r}",
+            )
+            self.assertIn(
+                "content-length", headers,
+                "补齐请求体之后（阶段二）：响应缺少 Content-Length",
+            )
+            content_length = int(headers["content-length"])
+
+            while len(body_bytes) < content_length:
+                body_bytes += self._recv_or_fail(
+                    sock, selector, response_deadline,
+                    "补齐请求体之后（阶段二：读取响应体）",
+                )
+            self.assertEqual(
+                len(body_bytes), content_length,
+                "补齐请求体之后（阶段二）：响应体长度应恰好等于 "
+                f"Content-Length={content_length}，实际收到 "
+                f"{len(body_bytes)} 字节",
+            )
+            self.assertEqual(
+                json.loads(body_bytes.decode("utf-8")),
+                {"error": "demo_failure"},
+                "补齐请求体之后（阶段二）：查询字符串与请求体内容不应改变"
+                f"路由的配置响应，实际响应体 {body_bytes!r}",
+            )
+        finally:
+            selector.close()
+            sock.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
