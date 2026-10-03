@@ -11,7 +11,11 @@ from urllib.parse import urlsplit
 ALLOWED_METHODS = ("GET", "POST")
 NOT_FOUND_BODY = b'{"error":"route_not_found"}'
 METHOD_NOT_SUPPORTED_BODY = b'{"error":"method_not_supported"}'
+REQUEST_BODY_MISMATCH_BODY = b'{"error":"request_body_mismatch"}'
 CONTENT_TYPE = "application/json; charset=utf-8"
+
+# 请求正文解析失败的哨兵：JSON 的 null 是合法正文，不能用 None 表示失败
+_INVALID = object()
 
 
 class RulesError(Exception):
@@ -51,6 +55,8 @@ class Routes(dict):
     """{(method, path): (status, body)} 映射，附带每条路由的延迟毫秒数。
 
     delays 为 {(method, path): int}，缺省或为 0 的路由不增加人为等待。
+    request_bodies 为 {(method, path): 样例 JSON 值}，仅包含显式配置了
+    requestBody 的 POST 路由；样例为解析后的 JSON 值（可以是 None）。
     """
 
 
@@ -78,10 +84,66 @@ def _ensure_finite_numbers(data):
                 stack.append((value[index], f"{location}[{index}]"))
 
 
+def _parse_request_body(raw):
+    """把请求正文按 UTF-8 解析为 JSON 值；任何失败都返回 _INVALID 哨兵。
+
+    空正文、非法 UTF-8、JSON 语法错误（含 NaN/Infinity 字面量）以及
+    1e400 这类溢出为非有限值的数字，统一视为校验失败。
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _INVALID
+    try:
+        value = json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return _INVALID
+    try:
+        _ensure_finite_numbers(value)
+    except ValueError:
+        return _INVALID
+    return value
+
+
+def _json_values_equal(expected, actual):
+    """递归比较两个解析后的 JSON 值是否相等。
+
+    对象要求键集合相同（键序无关）；数组长度与顺序都参与比较；字符串
+    区分大小写；数字按数值比较（1 等于 1.0）；布尔值与数字不相等；
+    null 只等于 null。
+    """
+    # bool 是 int 的子类，必须先单独处理：True 不等于 1
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return expected is actual
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return expected == actual
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if expected.keys() != actual.keys():
+            return False
+        return all(_json_values_equal(expected[k], actual[k]) for k in expected)
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(
+            _json_values_equal(e, a) for e, a in zip(expected, actual)
+        )
+    if isinstance(expected, str) and isinstance(actual, str):
+        return expected == actual
+    # 剩下的 JSON 类型只有 null
+    return expected is None and actual is None
+
+
+def _request_body_matches(sample, raw):
+    """请求正文是否与样例 JSON 值相等；正文非法时一律不匹配。"""
+    actual = _parse_request_body(raw)
+    if actual is _INVALID:
+        return False
+    return _json_values_equal(sample, actual)
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 Routes：{(method, path): (状态码, 响应字节)}。
 
-    返回值的 delays 属性为 {(method, path): 延迟毫秒数} 映射。
+    返回值的 delays 属性为 {(method, path): 延迟毫秒数} 映射，
+    request_bodies 属性为 {(method, path): 请求正文样例 JSON 值} 映射。
     """
     try:
         with open(path, "rb") as f:
@@ -109,6 +171,7 @@ def load_rules(path):
 
     routes = Routes()
     routes.delays = {}
+    routes.request_bodies = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -158,6 +221,24 @@ def load_rules(path):
             raise RulesError(
                 f"{where}.body cannot be encoded as UTF-8: {exc}"
             )
+        if "requestBody" in item:
+            if method != "POST":
+                raise RulesError(
+                    f"{where}: requestBody is only allowed on POST routes, "
+                    f"got method {method!r}"
+                )
+            sample = item["requestBody"]
+            try:
+                # 与 body 同理：样例中的字符串值或对象键含未配对代理码点时
+                # 无法编码为合法 UTF-8，整份规则加载失败
+                json.dumps(sample, ensure_ascii=False).encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise RulesError(
+                    f"{where}.requestBody cannot be encoded as UTF-8: {exc}"
+                )
+            # 显式 null 也是合法样例（只接受正文为 JSON 的 null），
+            # 因此用键是否存在区分“未配置”与“配置为 null”
+            routes.request_bodies[key] = sample
         routes[key] = (status, body)
         routes.delays[key] = delay_ms
     return routes
@@ -167,32 +248,43 @@ def _make_handler(routes):
     class MockHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def _discard_body(self):
-            # 匹配忽略请求体，但需读掉以保持 keep-alive 连接可用
+        def _read_body(self):
+            # 读取完整请求体（无 requestBody 的路由只是读掉以保持
+            # keep-alive 连接可用）；Content-Length 缺失或非法时视为空
             try:
                 remaining = int(self.headers.get("Content-Length") or 0)
             except ValueError:
-                return
+                return b""
+            chunks = []
             while remaining > 0:
                 chunk = self.rfile.read(min(remaining, 65536))
                 if not chunk:
                     break
+                chunks.append(chunk)
                 remaining -= len(chunk)
+            return b"".join(chunks)
 
         def _respond(self):
-            self._discard_body()
+            raw_body = self._read_body()
             path = urlsplit(self.path).path
             key = (self.command, path)
             entry = routes.get(key)
             if entry is None:
+                # 未命中路由时不校验请求体：即使正文非法也返回原有 404
                 self._send(404, NOT_FOUND_BODY)
-            else:
-                # 请求体已读完且路由已命中：每次命中（含错误状态码路由）
-                # 都先等待配置的时长，再发送状态行、响应头与响应体
-                delay_ms = routes.delays.get(key, 0)
-                if delay_ms:
-                    time.sleep(delay_ms / 1000)
-                self._send(entry[0], entry[1])
+                return
+            if key in routes.request_bodies:
+                # 命中且配置了 requestBody：正文必须与样例相等，否则统一
+                # 返回 400，不采用配置的状态、正文或延迟
+                if not _request_body_matches(routes.request_bodies[key], raw_body):
+                    self._send(400, REQUEST_BODY_MISMATCH_BODY)
+                    return
+            # 请求体已读完且（如有样例）校验通过：每次命中（含错误状态码
+            # 路由）都先等待配置的时长，再发送状态行、响应头与响应体
+            delay_ms = routes.delays.get(key, 0)
+            if delay_ms:
+                time.sleep(delay_ms / 1000)
+            self._send(entry[0], entry[1])
 
         def _send(self, status, body):
             self.send_response(status)
