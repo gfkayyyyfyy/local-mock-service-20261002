@@ -1,1 +1,1 @@
-{"routes":[{"method":"GET","path":"/hello","body":{"message":"你好"}},{"method":"POST","path":"/fail","status":503,"body":{"error":"demo_failure"}},{"method":"GET","path":"/slow","delayMs":200,"status":503,"body":{"error":"demo_failure"}}]}
+{"routes":[{"method":"GET","path":"/hello","body":{"message":"你好"}},{"method":"POST","path":"/check","requestBody":{"amount":1,"ok":true},"body":{"accepted":true}},{"method":"POST","path":"/fail","status":503,"body":{"error":"demo_failure"}},{"method":"GET","path":"/slow","delayMs":200,"status":503,"body":{"error":"demo_failure"}}]}

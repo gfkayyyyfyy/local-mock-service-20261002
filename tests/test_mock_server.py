@@ -2648,5 +2648,747 @@ class RulesFileLifecycleTests(unittest.TestCase):
                 restarted.stop()
 
 
+# ---------------------------------------------------------------------------
+# requestBody 请求正文样例校验回归
+#
+# POST 路由可选的 requestBody 以 JSON 样例约束完整请求正文：命中后按 UTF-8
+# 解析正文并与样例递归比较，不通过（含空正文、非法 UTF-8、JSON 语法错误、
+# 非有限数字）一律返回 400 request_body_mismatch，不采用配置的状态、正文
+# 或延迟；缺省 requestBody 时仍忽略正文。
+# ---------------------------------------------------------------------------
+
+REQUEST_BODY_MISMATCH = b'{"error":"request_body_mismatch"}'
+NOT_FOUND_BODY = b'{"error":"route_not_found"}'
+
+# 行为测试使用的规则：
+#   POST /check   样例 {"amount":1,"ok":true}，缺省 200
+#   POST /guarded 样例 {"v":1}，配置 503 + 200ms 延迟（校验失败时均不得使用）
+#   POST /loose   无 requestBody，任何正文都被忽略
+#   POST /nullish 样例为显式 null，只接受 JSON null
+#   GET  /hello   不受影响
+REQUEST_BODY_RULES = [
+    {"method": "POST", "path": "/check",
+     "requestBody": {"amount": 1, "ok": True},
+     "body": {"accepted": True}},
+    {"method": "POST", "path": "/guarded", "delayMs": DELAY_MS, "status": 503,
+     "requestBody": {"v": 1}, "body": {"error": "demo_failure"}},
+    {"method": "POST", "path": "/loose", "body": {"ignored": True}},
+    {"method": "POST", "path": "/nullish", "requestBody": None,
+     "body": {"was": "null"}},
+    {"method": "GET", "path": "/hello", "body": {"message": "你好"}},
+]
+
+# 与样例相等的各种正文写法：键序、排版空白、1 与 1.0 数值相等
+MATCHING_BODIES = [
+    ("紧凑原样", b'{"amount":1,"ok":true}'),
+    ("键序不同", b'{"ok":true,"amount":1.0}'),
+    ("多余空白", b'  {  "amount" : 1 ,  "ok" : true }  '),
+    ("整数写为浮点", b'{"amount":1.0,"ok":true}'),
+    ("指数数字", b'{"amount":1e0,"ok":true}'),
+]
+
+# 与样例不相等但本身是合法 JSON 的正文
+MISMATCHING_VALID_BODIES = [
+    ("ok 为数字 1（布尔不等于数字）", b'{"ok":1,"amount":1.0}'),
+    ("ok 为 0", b'{"ok":0,"amount":1}'),
+    ("ok 为字符串", b'{"ok":"true","amount":1}'),
+    ("amount 为布尔", b'{"amount":true,"ok":true}'),
+    ("amount 数值不同", b'{"amount":2,"ok":true}'),
+    ("缺少 amount 键", b'{"ok":true}'),
+    ("缺少 ok 键", b'{"amount":1}'),
+    ("多出额外键", b'{"amount":1,"ok":true,"extra":null}'),
+    ("空对象", b'{}'),
+    ("对象写成数组", b'[{"amount":1,"ok":true}]'),
+    ("整体为 null", b'null'),
+]
+
+# 根本无法解析为合法有限 JSON 的正文
+MALFORMED_BODIES = [
+    ("空正文", b""),
+    ("非法 UTF-8", b"\xff\xfe"),
+    ("孤立左花括号", b"{"),
+    ("被截断的对象", b'{"amount":1,"ok":true'),
+    ("裸文本", b"not json"),
+    ("NaN 字面量", b'{"amount":NaN,"ok":true}'),
+    ("Infinity 字面量", b'{"amount":Infinity,"ok":true}'),
+    ("溢出数字 1e400", b'{"amount":1e400,"ok":true}'),
+]
+
+
+def raw_request(port, raw_body, target="/check", method="POST",
+                content_type=None, send_content_length=True,
+                wait_response=True):
+    """用裸 socket 发送请求，返回 (status, headers, body_bytes, sock)。
+
+    可自定义 Content-Type 与是否发送 Content-Length；sock 交由调用方关闭，
+    以便复用连接或在响应到达前观察服务行为。
+    """
+    sock = socket.create_connection(
+        ("127.0.0.1", port), timeout=REQUEST_TIMEOUT
+    )
+    head_lines = [f"{method} {target} HTTP/1.1", f"Host: 127.0.0.1:{port}"]
+    if send_content_length:
+        head_lines.append(f"Content-Length: {len(raw_body)}")
+    if content_type is not None:
+        head_lines.append(f"Content-Type: {content_type}")
+    # 要求服务端响应后关闭连接，裸 socket 读到 EOF 即可拿到完整响应
+    head_lines.append("Connection: close")
+    sock.sendall(("\r\n".join(head_lines) + "\r\n\r\n").encode("ascii"))
+    if raw_body:
+        sock.sendall(raw_body)
+    if not wait_response:
+        return None, None, None, sock
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    head, _, body_bytes = data.partition(b"\r\n\r\n")
+    status_line = head.split(b"\r\n", 1)[0]
+    status = int(status_line.split(b" ", 2)[1])
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        name, sep, value = line.partition(b":")
+        if sep:
+            headers[name.strip().decode("ascii").lower()] = (
+                value.strip().decode("ascii")
+            )
+    return status, headers, body_bytes, sock
+
+
+class RequestBodyBehaviorTests(unittest.TestCase):
+    """requestBody 命中校验：匹配放行、不匹配一律 400 且不用配置响应。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_request_body.json", REQUEST_BODY_RULES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _assert_400_mismatch(self, label, raw_body, target="/check"):
+        status, headers, raw = request(self.port, "POST", target, body=raw_body)
+        self.assertEqual(
+            status, 400,
+            f"样例 {label}: 应返回 400，实际 {status}；响应={raw!r}",
+        )
+        self.assertEqual(
+            headers.get("Content-Type"), CONTENT_TYPE,
+            f"样例 {label}: 400 响应 Content-Type 应为 {CONTENT_TYPE!r}",
+        )
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_matching_bodies_return_configured_response(self):
+        for label, raw_body in MATCHING_BODIES:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/check", body=raw_body
+                )
+                self.assertEqual(status, 200, f"样例 {label}: 应返回 200")
+                self.assertEqual(
+                    headers.get("Content-Type"), CONTENT_TYPE
+                )
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"accepted": True}
+                )
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_task_example_ok_true_amount_float_accepted(self):
+        # 任务明确约定的请求：{"ok":true,"amount":1.0} -> 200
+        status, headers, raw = request(
+            self.port, "POST", "/check", body=b'{"ok":true,"amount":1.0}'
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, b'{"accepted":true}')
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_task_example_ok_one_rejected(self):
+        # 任务明确约定：ok 改为 1（数字不等于布尔）-> 400
+        self._assert_400_mismatch(
+            "ok 为数字 1", b'{"ok":1,"amount":1.0}'
+        )
+
+    def test_valid_json_but_mismatching_bodies_return_400(self):
+        for label, raw_body in MISMATCHING_VALID_BODIES:
+            with self.subTest(正文=label):
+                self._assert_400_mismatch(label, raw_body)
+
+    def test_malformed_bodies_return_400(self):
+        for label, raw_body in MALFORMED_BODIES:
+            with self.subTest(正文=label):
+                self._assert_400_mismatch(label, raw_body)
+
+    def test_explicit_null_sample_only_accepts_json_null(self):
+        for label, raw_body, expected in [
+            ("JSON null", b"null", 200),
+            ("空正文", b"", 400),
+            ("数字 0", b"0", 400),
+            ("布尔 false", b"false", 400),
+            ("字符串 null", b'"null"', 400),
+            ("空对象", b"{}", 400),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/nullish", body=raw_body
+                )
+                self.assertEqual(status, expected)
+                if expected == 200:
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")), {"was": "null"}
+                    )
+                else:
+                    self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+
+    def test_mismatch_does_not_apply_configured_status_body_or_delay(self):
+        # /guarded 配置了 503 + 200ms 延迟：校验失败时 400 立即返回，
+        # 不等待、不使用配置的状态与正文
+        start = time.monotonic()
+        status, headers, raw = request(
+            self.port, "POST", "/guarded", body=b'{"v":2}'
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(status, 400)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+        self.assertLess(
+            elapsed, NO_DELAY_MAX_SECONDS,
+            f"不匹配时不应应用 200ms 延迟，实际 {elapsed * 1000:.1f}ms",
+        )
+        # 语法错误同样立即 400
+        status, _, raw = request(self.port, "POST", "/guarded", body=b"{")
+        self.assertEqual(status, 400)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+
+    def test_match_still_applies_delay_and_configured_response(self):
+        # 校验通过后：读完正文 -> 等满 200ms -> 返回配置的 503 与正文
+        status, headers, raw, elapsed = timed_request(
+            self.port, "POST", "/guarded", body=b'{"v":1.0}'
+        )
+        self.assertGreaterEqual(
+            elapsed, DELAY_MIN_SECONDS,
+            f"校验通过后仍应等待 {DELAY_MS}ms，实际 {elapsed * 1000:.1f}ms",
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), {"error": "demo_failure"}
+        )
+
+    def test_route_without_request_body_ignores_any_body(self):
+        for label, raw_body in [
+            ("空正文", b""),
+            ("非法 UTF-8", b"\xff"),
+            ("JSON 语法错误", b"{"),
+            ("合法但任意的 JSON", b'{"anything":false}'),
+            ("裸文本", b"plain text"),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/loose", body=raw_body
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"ignored": True}
+                )
+
+    def test_unmatched_route_with_invalid_body_returns_404(self):
+        # 未命中即使正文非法也返回原有 404 正文，不做请求体校验
+        for label, raw_body in [
+            ("非法 UTF-8", b"\xff"),
+            ("JSON 语法错误", b"{"),
+            ("合法 JSON", b'{"amount":1,"ok":true}'),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/missing", body=raw_body
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(raw, NOT_FOUND_BODY)
+
+    def test_query_string_still_ignored_in_matching(self):
+        status, headers, raw = request(
+            self.port, "POST", "/check?x=1&y=2",
+            body=b'{"ok":true,"amount":1}',
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw.decode("utf-8")), {"accepted": True})
+
+    def test_content_type_does_not_affect_validation(self):
+        # 正文一律按 UTF-8 JSON 解析，与 Content-Type 无关
+        for label, content_type in [
+            ("text/plain", "text/plain"),
+            ("application/xml", "application/xml"),
+            ("application/json; charset=latin-1",
+             "application/json; charset=latin-1"),
+        ]:
+            with self.subTest(Content_Type=label):
+                try:
+                    status, headers, raw, sock = raw_request(
+                        self.port, b'{"amount":1,"ok":true}',
+                        content_type=content_type,
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertEqual(raw, b'{"accepted":true}')
+                finally:
+                    sock.close()
+
+    def test_no_content_length_with_empty_body_is_mismatch(self):
+        # 不发送 Content-Length 且无正文字节：按空正文处理 -> 400
+        try:
+            status, headers, raw, sock = raw_request(
+                self.port, b"", send_content_length=False
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+        finally:
+            sock.close()
+
+    def test_keep_alive_reused_after_400_and_200(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=REQUEST_TIMEOUT)
+        try:
+            sequence = [
+                (b'{"ok":1,"amount":1}', 400),
+                (b'{"ok":true,"amount":1}', 200),
+                (b"{", 400),
+                (b'garbage', 400),
+                (b'{"amount":1.0,"ok":true}', 200),
+            ]
+            for raw_body, expected in sequence:
+                with self.subTest(body=raw_body):
+                    conn.request("POST", "/check", body=raw_body)
+                    resp = conn.getresponse()
+                    raw = resp.read()
+                    self.assertEqual(resp.status, expected)
+                    self.assertEqual(
+                        resp.getheader("Content-Type"), CONTENT_TYPE
+                    )
+                    self.assertEqual(
+                        int(resp.getheader("Content-Length")), len(raw)
+                    )
+        finally:
+            conn.close()
+
+    def test_response_validated_only_after_entire_body_read(self):
+        # 只发一半正文时服务必须保持静默；补齐后（此处整体为 JSON 语法
+        # 错误）才返回 400
+        partial_body = b'{"ok":1'  # 合法前缀但不完整
+        sock = socket.create_connection(
+            ("127.0.0.1", self.port), timeout=REQUEST_TIMEOUT
+        )
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        selector = DefaultSelector()
+        selector.register(sock, EVENT_READ)
+        try:
+            sock.sendall(
+                (f"POST /check HTTP/1.1\r\n"
+                 f"Host: 127.0.0.1:{self.port}\r\n"
+                 f"Content-Length: {len(partial_body) + 3}\r\n"
+                 f"\r\n").encode("ascii") + partial_body
+            )
+            ready = selector.select(timeout=PARTIAL_PRE_WAIT_SECONDS)
+            if ready:
+                self.fail(
+                    f"正文未读完时不应响应，实际收到 {sock.recv(4096)!r}"
+                )
+            # 补齐 3 字节，整体 '{"ok":1???' 为 JSON 语法错误 -> 400
+            sock.sendall(b"???")
+            chunks = []
+            sock.settimeout(PARTIAL_RESPONSE_TIMEOUT)
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                data = b"".join(chunks)
+                head, _, body_bytes = data.partition(b"\r\n\r\n")
+                if head and len(body_bytes) >= len(REQUEST_BODY_MISMATCH):
+                    break
+            data = b"".join(chunks)
+            self.assertIn(b"HTTP/1.1 400", data)
+            self.assertTrue(
+                data.endswith(REQUEST_BODY_MISMATCH),
+                f"应返回 request_body_mismatch，实际 {data!r}",
+            )
+        finally:
+            selector.close()
+            sock.close()
+
+    def test_other_methods_keep_501_behavior_on_guarded_route(self):
+        # PUT/HEAD 在配置了 requestBody 的路径上仍走既有 501 流程
+        status, headers, raw = request(
+            self.port, "PUT", "/check", body=b'{"amount":1,"ok":true}'
+        )
+        self.assertEqual(status, 501)
+        self.assertEqual(headers.get("Connection"), "close")
+        self.assertEqual(raw, METHOD_REJECT_BODY)
+
+        status, headers, raw = request(self.port, "HEAD", "/guarded")
+        self.assertEqual(status, 501)
+        self.assertEqual(raw, b"")
+        self.assertEqual(
+            int(headers["Content-Length"]), len(METHOD_REJECT_BODY)
+        )
+
+    def test_get_route_unaffected(self):
+        status, headers, raw = request(self.port, "GET", "/hello")
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, '{"message":"你好"}'.encode("utf-8"))
+
+
+class ScalarAndNestedRequestBodyTests(unittest.TestCase):
+    """标量与嵌套样例：字符串大小写、数组顺序、嵌套结构逐值比较。"""
+
+    def test_scalar_string_number_and_array_samples(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_request_body_scalars.json",
+                [
+                    {"method": "POST", "path": "/s", "requestBody": "HeLLo",
+                     "body": {"ok": "string"}},
+                    {"method": "POST", "path": "/n", "requestBody": 42,
+                     "body": {"ok": "number"}},
+                    {"method": "POST", "path": "/a",
+                     "requestBody": [1, True, "x", {"k": [2, 3]}],
+                     "body": {"ok": "array"}},
+                ],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                cases = [
+                    ("/s", b'"HeLLo"', 200),
+                    ("/s", b'"hello"', 400),     # 字符串区分大小写
+                    ("/s", b'"HeLLo "', 400),    # 多余字符
+                    ("/n", b"42", 200),
+                    ("/n", b"42.0", 200),        # 数值相等
+                    ("/n", b"true", 400),        # 布尔不等于数字
+                    ("/n", b'"42"', 400),
+                    ("/a", b'[1,true,"x",{"k":[2,3]}]', 200),
+                    ("/a", b'[1,true,"x",{"k":[3,2]}]', 400),  # 数组顺序
+                    ("/a", b'[1,true,"x"]', 400),              # 长度不同
+                    ("/a", b'[1,true,"x",{"k":[2,3]},9]', 400),
+                    ("/a", b'{"0":1}', 400),
+                ]
+                for target, raw_body, expected in cases:
+                    with self.subTest(target=target, body=raw_body):
+                        status, headers, raw = request(
+                            port, "POST", target, body=raw_body
+                        )
+                        self.assertEqual(
+                            status, expected,
+                            f"POST {target} 正文 {raw_body!r}: 期望 "
+                            f"{expected}，实际 {status}；{raw!r}",
+                        )
+            finally:
+                server.stop()
+
+
+class JsonEqualityHelperTests(unittest.TestCase):
+    """直接锁定递归比较语义（无需启动服务）。"""
+
+    def test_comparison_semantics(self):
+        from mock_server import _json_equal
+
+        equal_pairs = [
+            ({"a": 1, "b": True}, {"b": True, "a": 1.0}),
+            ({"a": {"b": [1, 2, 3]}}, {"a": {"b": [1.0, 2, 3]}}),
+            ([1, "x", None, False], [1, "x", None, False]),
+            ("Case", "Case"),
+            (1, 1.0),
+            (0, 0.0),
+            (-0.0, 0),
+            (None, None),
+            (True, True),
+            ([], []),
+            ({}, {}),
+        ]
+        for expected, actual in equal_pairs:
+            with self.subTest(pair=(expected, actual)):
+                self.assertTrue(
+                    _json_equal(expected, actual),
+                    f"{expected!r} 应等于 {actual!r}",
+                )
+
+        unequal_pairs = [
+            ({"a": 1}, {"a": 1, "b": 2}),
+            ({"a": 1, "b": 2}, {"a": 1}),
+            ([1, 2], [2, 1]),
+            ([1], [1, 0]),
+            ("Case", "case"),
+            (1, True),
+            (0, False),
+            (True, 1),
+            (False, 0.0),
+            (None, False),
+            (None, 0),
+            ("1", 1),
+            ([1], {"0": 1}),
+            ({"a": None}, {"a": False}),
+            (1.5, 1),
+        ]
+        for expected, actual in unequal_pairs:
+            with self.subTest(pair=(expected, actual)):
+                self.assertFalse(
+                    _json_equal(expected, actual),
+                    f"{expected!r} 不应等于 {actual!r}",
+                )
+
+
+# requestBody 规则加载校验：GET 路由携带 requestBody，或样例字符串/键无法
+# 编码为 UTF-8 时，load_rules 抛 RulesError，CLI 退出码 2 且不监听
+INVALID_REQUEST_BODY_RULE_CASES = [
+    # (说明, 路由项, 非法项下标)
+    (
+        "GET 路由携带 requestBody（位于 routes[0]）",
+        {"method": "GET", "path": "/g", "requestBody": {"v": 1}, "body": {}},
+        0,
+    ),
+    (
+        "GET 路由携带 requestBody（合法路由之后的 routes[1]）",
+        {"method": "GET", "path": "/g", "requestBody": None, "body": {}},
+        1,
+    ),
+    (
+        "样例字符串含孤立高代理",
+        {"method": "POST", "path": "/p",
+         "requestBody": "a\ud800b", "body": {}},
+        0,
+    ),
+    (
+        "嵌套样例字符串含孤立低代理",
+        {"method": "POST", "path": "/p",
+         "requestBody": {"outer": ["\udc00"]}, "body": {}},
+        0,
+    ),
+    (
+        "样例对象键含孤立代理",
+        {"method": "POST", "path": "/p",
+         "requestBody": {"\ud800": 1}, "body": {}},
+        0,
+    ),
+    (
+        "数组样例中的对象键含孤立代理",
+        {"method": "POST", "path": "/p",
+         "requestBody": [{"\ud800": 1}], "body": {}},
+        0,
+    ),
+]
+
+
+class RequestBodyRulesValidationTests(unittest.TestCase):
+    """requestBody 只能用于 POST；样例字符串与对象键须可编码为 UTF-8。"""
+
+    def _items_for(self, bad_item, bad_index):
+        if bad_index == 0:
+            return [bad_item]
+        return [
+            {"method": "GET", "path": "/ok", "body": {"fine": 1}},
+            bad_item,
+        ]
+
+    def _write_invalid_rules(self, tmp, name, bad_item, bad_index):
+        # ensure_ascii 默认输出 \ud800 形式的 ASCII 转义：测试文件本身可
+        # 编码为 UTF-8，而服务端解析后仍得到含孤立代理码点的字符串
+        return write_rules_text(
+            tmp,
+            name,
+            json.dumps({"routes": self._items_for(bad_item, bad_index)}),
+        )
+
+    def test_load_rules_rejects_invalid_request_body(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_item, bad_index) in enumerate(
+                INVALID_REQUEST_BODY_RULE_CASES
+            ):
+                with self.subTest(样例=label):
+                    rules_path = self._write_invalid_rules(
+                        tmp, f"rules_bad_request_body_{index}.json",
+                        bad_item, bad_index,
+                    )
+                    with self.assertRaises(RulesError) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn(
+                        f"routes[{bad_index}].requestBody", message,
+                        f"样例 {label}: 错误应标明 routes[{bad_index}]"
+                        f".requestBody，实际 {message!r}",
+                    )
+
+    def test_surrogate_cases_mention_utf8(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_item, bad_index) in enumerate(
+                INVALID_REQUEST_BODY_RULE_CASES
+            ):
+                if "代理" not in label:
+                    continue
+                with self.subTest(样例=label):
+                    rules_path = self._write_invalid_rules(
+                        tmp, f"rules_bad_request_body_sur_{index}.json",
+                        bad_item, bad_index,
+                    )
+                    with self.assertRaises(RulesError) as ctx:
+                        load_rules(rules_path)
+                    self.assertIn("UTF-8", str(ctx.exception))
+
+    def test_cli_rejects_with_exit_code_2_and_location(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_item, bad_index) in enumerate(
+                INVALID_REQUEST_BODY_RULE_CASES
+            ):
+                with self.subTest(样例=label):
+                    rules_path = self._write_invalid_rules(
+                        tmp, f"rules_bad_request_body_cli_{index}.json",
+                        bad_item, bad_index,
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        f"routes[{bad_index}].requestBody", stderr,
+                        f"样例 {label}: 标准错误应包含路由位置与字段名，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn("Traceback", stderr)
+                    self.assertNotIn(STARTUP_MARKER, stdout)
+
+    def test_request_body_accepts_any_json_value_type(self):
+        # 显式 null、数字、字符串、布尔、数组、对象样例均可加载
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            samples = [None, 1, "x", True, False, [1, 2], {"k": "v"}, []]
+            routes = [
+                {"method": "POST", "path": f"/s{i}",
+                 "requestBody": sample, "body": {"i": i}}
+                for i, sample in enumerate(samples)
+            ]
+            rules_path = write_rules(tmp, "rules_rb_types.json", routes)
+            loaded = load_rules(rules_path)
+            for i, sample in enumerate(samples):
+                self.assertEqual(
+                    loaded.request_bodies[("POST", f"/s{i}")], sample
+                )
+
+    def test_duplicate_routes_with_request_body_still_rejected(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_rb_dup.json",
+                [
+                    {"method": "POST", "path": "/same",
+                     "requestBody": {"a": 1}, "body": {}},
+                    {"method": "POST", "path": "/same",
+                     "requestBody": {"a": 2}, "body": {"x": 1}},
+                ],
+            )
+            with self.assertRaises(RulesError) as ctx:
+                load_rules(rules_path)
+            self.assertIn("duplicate route", str(ctx.exception))
+            self.assertIn("routes[1]", str(ctx.exception))
+
+    def test_paired_surrogate_and_chinese_sample_load_and_match(self):
+        # 与 body 相同：正确配对的代理与中文样例合法，且可端到端匹配
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules_text(
+                tmp,
+                "rules_rb_unicode.json",
+                '{"routes":[{"method":"POST","path":"/u",'
+                '"requestBody":{"face":"\\ud83d\\ude00","text":"你好"},'
+                '"body":{"ok":true}}]}',
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                raw_body = (
+                    '{"text":"你好","face":"😀"}'
+                ).encode("utf-8")
+                status, headers, raw = request(
+                    port, "POST", "/u", body=raw_body
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(raw, b'{"ok":true}')
+                # 表情符号不匹配时同样 400
+                status, _, raw = request(
+                    port, "POST", "/u",
+                    body='{"text":"你好","face":"x"}'.encode("utf-8"),
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+            finally:
+                server.stop()
+
+
+class RequestBodyRemovalTests(unittest.TestCase):
+    """移除样例后，原本匹配与不匹配的两种正文都应返回固定响应。"""
+
+    def test_removing_request_body_makes_both_bodies_pass(self):
+        route_with_sample = {
+            "method": "POST", "path": "/check",
+            "requestBody": {"amount": 1, "ok": True},
+            "body": {"accepted": True},
+        }
+        route_without_sample = {
+            "method": "POST", "path": "/check",
+            "body": {"accepted": True},
+        }
+        bodies = [
+            ("数值/布尔匹配", b'{"ok":true,"amount":1.0}'),
+            ("ok 为数字（不匹配）", b'{"ok":1,"amount":1.0}'),
+        ]
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            with_sample = write_rules(
+                tmp, "rules_with_sample.json", [route_with_sample]
+            )
+            without_sample = write_rules(
+                tmp, "rules_without_sample.json", [route_without_sample]
+            )
+            port_a = free_port()
+            port_b = free_port()
+            guarded = ServerProcess(with_sample, port_a)
+            loose = ServerProcess(without_sample, port_b)
+            try:
+                expectations = {
+                    port_a: [200, 400],
+                    port_b: [200, 200],
+                }
+                for port, expected_statuses in expectations.items():
+                    for (label, raw_body), expected in zip(
+                        bodies, expected_statuses
+                    ):
+                        with self.subTest(port=port, 正文=label):
+                            status, headers, raw = request(
+                                port, "POST", "/check", body=raw_body
+                            )
+                            self.assertEqual(
+                                status, expected,
+                                f"端口 {port} 正文 {label}: 期望 "
+                                f"{expected}，实际 {status}",
+                            )
+                            if expected == 200:
+                                self.assertEqual(raw, b'{"accepted":true}')
+                            else:
+                                self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+            finally:
+                guarded.stop()
+                loose.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
