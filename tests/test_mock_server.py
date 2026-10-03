@@ -3390,5 +3390,504 @@ class RequestBodyRemovalTests(unittest.TestCase):
                 loose.stop()
 
 
+# ---------------------------------------------------------------------------
+# requestBodyMode 子集匹配回归
+#
+# 路由项可选的 requestBodyMode 仅允许与 POST 路由的显式 requestBody 一起
+# 出现（null 样例也算存在），取值为区分大小写的 "exact" 或 "subset"：
+# 省略或 "exact" 保持整体相等比较；"subset" 要求样例对象的所有键存在于
+# 请求对应对象中、值递归按同一模式比较，请求对象允许额外键；数组仍按
+# 相同长度与顺序比较（元素对象同样允许额外键），不接受前缀匹配。缺键、
+# 被约束值不等或类型不符一律 400 request_body_mismatch，不采用配置的
+# 状态、正文或延迟；完整正文仍须通过 UTF-8、JSON 语法与非有限数字检查。
+# ---------------------------------------------------------------------------
+
+# 行为测试使用的规则（对应任务验收场景）：
+#   POST /check   subset 样例 {"user":{"id":1},"tags":["a"]}，503 + 配置正文
+#   POST /exact   同样样例但不配置模式（省略即 exact），用于对照
+#   POST /anyobj  subset 样例 {"meta":{}}，空对象只匹配对象
+#   POST /guarded subset 样例 {"v":1}，配置 503 + 200ms 延迟（失败时不得使用）
+SUBSET_MODE_RULES = [
+    {"method": "POST", "path": "/check", "requestBodyMode": "subset",
+     "requestBody": {"user": {"id": 1}, "tags": ["a"]},
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/exact",
+     "requestBody": {"user": {"id": 1}, "tags": ["a"]},
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/anyobj", "requestBodyMode": "subset",
+     "requestBody": {"meta": {}}, "body": {"ok": True}},
+    {"method": "POST", "path": "/guarded", "requestBodyMode": "subset",
+     "delayMs": DELAY_MS, "status": 503,
+     "requestBody": {"v": 1}, "body": {"error": "demo_failure"}},
+]
+
+
+class SubsetRequestBodyTests(unittest.TestCase):
+    """subset 模式：额外键放行，缺键/值不等/类型不符一律 400。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_subset_mode.json", SUBSET_MODE_RULES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _assert_status_and_body(self, label, target, raw_body,
+                                expected_status, expected_raw):
+        status, headers, raw = request(
+            self.port, "POST", target, body=raw_body
+        )
+        self.assertEqual(
+            status, expected_status,
+            f"样例 {label}: 状态码应为 {expected_status}，实际 {status}；"
+            f"响应={raw!r}",
+        )
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, expected_raw, f"样例 {label}: 响应体不符")
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def _assert_400_mismatch(self, label, raw_body, target="/check"):
+        self._assert_status_and_body(
+            label, target, raw_body, 400, REQUEST_BODY_MISMATCH
+        )
+
+    def test_task_acceptance_body_with_extra_keys_returns_configured_503(self):
+        # 任务验收正文：id 写为 1.0、user 与顶层均有额外键、含中文
+        self._assert_status_and_body(
+            "验收正文",
+            "/check",
+            '{"user":{"id":1.0,"name":"甲"},"tags":["a"],'
+            '"trace":"demo"}'.encode("utf-8"),
+            503, b'{"accepted":true}',
+        )
+
+    def test_task_acceptance_rejections(self):
+        # 任务验收：id 改为 true（布尔不等于数字）或 tags 多一个元素 -> 400
+        self._assert_400_mismatch(
+            "id 为布尔 true", b'{"user":{"id":true},"tags":["a"]}'
+        )
+        self._assert_400_mismatch(
+            "tags 多一个元素", b'{"user":{"id":1},"tags":["a","b"]}'
+        )
+
+    def test_subset_matching_and_mismatching_bodies(self):
+        matching = [
+            ("完全一致", b'{"user":{"id":1},"tags":["a"]}'),
+            ("键序不同", b'{"tags":["a"],"user":{"id":1}}'),
+            ("仅顶层额外键", b'{"user":{"id":1},"tags":["a"],"x":null}'),
+            ("仅嵌套额外键", b'{"user":{"id":1,"extra":[1,2]},"tags":["a"]}'),
+            ("数组元素对象允许额外键",
+             b'{"user":{"id":1},"tags":["a"],"unused":1}'),
+        ]
+        for label, raw_body in matching:
+            with self.subTest(正文=label):
+                self._assert_status_and_body(
+                    label, "/check", raw_body, 503, b'{"accepted":true}'
+                )
+        mismatching = [
+            ("缺少 user 键", b'{"tags":["a"]}'),
+            ("缺少嵌套 id 键", b'{"user":{},"tags":["a"]}'),
+            ("缺少 tags 键", b'{"user":{"id":1}}'),
+            ("id 数值不同", b'{"user":{"id":2},"tags":["a"]}'),
+            ("id 为字符串", b'{"user":{"id":"1"},"tags":["a"]}'),
+            ("tags 少元素（数组不接受前缀匹配）",
+             b'{"user":{"id":1},"tags":[]}'),
+            ("tags 元素不同", b'{"user":{"id":1},"tags":["A"]}'),
+            ("tags 不是数组", b'{"user":{"id":1},"tags":"a"}'),
+            ("user 不是对象", b'{"user":1,"tags":["a"]}'),
+            ("整体不是对象", b'[{"user":{"id":1},"tags":["a"]}]'),
+            ("整体为 null", b'null'),
+        ]
+        for label, raw_body in mismatching:
+            with self.subTest(正文=label):
+                self._assert_400_mismatch(label, raw_body)
+
+    def test_empty_object_sample_matches_any_object_only(self):
+        for label, raw_body, expected in [
+            ("空对象", b'{"meta":{}}', 200),
+            ("meta 为非空对象", b'{"meta":{"a":1,"b":[2]}}', 200),
+            ("顶层额外键", b'{"meta":{},"extra":true}', 200),
+            ("meta 为 null", b'{"meta":null}', 400),
+            ("meta 为数组", b'{"meta":[]}', 400),
+            ("meta 为字符串", b'{"meta":"{}"}', 400),
+            ("缺少 meta 键", b'{}', 400),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/anyobj", body=raw_body
+                )
+                self.assertEqual(status, expected, f"样例 {label}")
+                if expected == 200:
+                    self.assertEqual(raw, b'{"ok":true}')
+                else:
+                    self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+
+    def test_array_element_objects_allow_extra_keys_but_no_prefix(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_subset_array.json",
+                [
+                    {"method": "POST", "path": "/arr",
+                     "requestBodyMode": "subset",
+                     "requestBody": [{"id": 1}, {"id": 2}],
+                     "body": {"ok": True}},
+                ],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                for label, raw_body, expected in [
+                    ("元素对象带额外键",
+                     b'[{"id":1,"x":1},{"id":2,"y":2}]', 200),
+                    ("完全一致", b'[{"id":1},{"id":2}]', 200),
+                    ("长度不同（不接受前缀）", b'[{"id":1}]', 400),
+                    ("顺序不同", b'[{"id":2},{"id":1}]', 400),
+                    ("元素缺键", b'[{"id":1},{"x":2}]', 400),
+                ]:
+                    with self.subTest(正文=label):
+                        status, headers, raw = request(
+                            port, "POST", "/arr", body=raw_body
+                        )
+                        self.assertEqual(status, expected, f"样例 {label}")
+            finally:
+                server.stop()
+
+    def test_full_body_checks_still_apply_to_extra_fields(self):
+        # 额外字段中的非法内容同样令整体 400：额外键不能绕过检查
+        for label, raw_body in [
+            ("额外字段含 NaN 字面量",
+             b'{"user":{"id":1},"tags":["a"],"extra":NaN}'),
+            ("额外字段含溢出数字 1e400",
+             b'{"user":{"id":1},"tags":["a"],"extra":1e400}'),
+            ("非法 UTF-8", b"\xff\xfe"),
+            ("JSON 语法错误", b'{"user":{"id":1},"tags":["a"],'),
+            ("空正文", b""),
+        ]:
+            with self.subTest(正文=label):
+                self._assert_400_mismatch(label, raw_body)
+
+    def test_mismatch_skips_configured_status_body_and_delay(self):
+        # subset 校验失败：立即 400，不等待 200ms、不使用配置的 503 与正文
+        start = time.monotonic()
+        status, headers, raw = request(
+            self.port, "POST", "/guarded", body=b'{"v":1,"extra":1,"bad":'
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(status, 400)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+        self.assertLess(
+            elapsed, NO_DELAY_MAX_SECONDS,
+            f"不匹配时不应应用 {DELAY_MS}ms 延迟，实际 {elapsed * 1000:.1f}ms",
+        )
+        # 校验通过（含额外键）：仍按原规则应用延迟并返回配置响应
+        status, headers, raw, elapsed = timed_request(
+            self.port, "POST", "/guarded", body=b'{"v":1.0,"extra":"ok"}'
+        )
+        self.assertGreaterEqual(elapsed, DELAY_MIN_SECONDS)
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), {"error": "demo_failure"}
+        )
+
+    def test_exact_mode_unchanged_when_mode_omitted(self):
+        # 删除模式字段后（/exact 未配置 requestBodyMode）：带额外键 -> 400
+        self._assert_400_mismatch(
+            "exact 模式带额外键",
+            b'{"user":{"id":1},"tags":["a"],"trace":"demo"}',
+            target="/exact",
+        )
+        # 完全相等仍放行
+        self._assert_status_and_body(
+            "exact 模式完全相等",
+            "/exact",
+            b'{"user":{"id":1.0},"tags":["a"]}',
+            503, b'{"accepted":true}',
+        )
+
+
+class JsonSubsetHelperTests(unittest.TestCase):
+    """直接锁定子集匹配语义（无需启动服务）。"""
+
+    def test_subset_semantics(self):
+        from mock_server import _json_subset
+
+        matching_pairs = [
+            ({}, {}),
+            ({}, {"a": 1}),
+            ({"a": 1}, {"a": 1.0, "b": 2}),
+            ({"a": {"b": 1}}, {"a": {"b": 1, "c": 2}, "d": 3}),
+            ([{"a": 1}], [{"a": 1, "b": 2}]),
+            ([1, "x"], [1.0, "x"]),
+            ({"t": [1, {"k": None}]}, {"t": [1, {"k": None, "j": 0}]}),
+            ({"s": "Case"}, {"s": "Case"}),
+            ({"n": None}, {"n": None}),
+            ({"b": True}, {"b": True}),
+            ([], []),
+        ]
+        for expected, actual in matching_pairs:
+            with self.subTest(pair=(expected, actual)):
+                self.assertTrue(
+                    _json_subset(expected, actual),
+                    f"{expected!r} 应是 {actual!r} 的子集",
+                )
+
+        non_matching_pairs = [
+            ({"a": 1}, {}),                    # 缺键
+            ({"a": 1}, {"a": 2}),              # 被约束值不等
+            ({"a": 1}, {"a": True}),           # 布尔不等于数字
+            ({"a": True}, {"a": 1}),
+            ({"a": 1}, {"a": "1"}),            # 类型不符
+            ({"a": None}, {"a": 0}),           # null 只匹配 null
+            ({"a": None}, {"a": False}),
+            ({"s": "Case"}, {"s": "case"}),    # 字符串区分大小写
+            ({}, []),                          # 空对象只匹配对象
+            ({}, None),
+            ([1], [1, 2]),                     # 数组不接受前缀匹配
+            ([1, 2], [1]),
+            ([1, 2], [2, 1]),                  # 数组顺序参与比较
+            ([{"a": 1}], [{"b": 1}]),          # 数组元素对象缺键
+            ({"a": {"b": 1}}, {"a": {"c": 1}}),
+            ({"a": {}}, {"a": []}),            # 嵌套空对象只匹配对象
+            (1, True),
+            ("1", 1),
+        ]
+        for expected, actual in non_matching_pairs:
+            with self.subTest(pair=(expected, actual)):
+                self.assertFalse(
+                    _json_subset(expected, actual),
+                    f"{expected!r} 不应是 {actual!r} 的子集",
+                )
+
+
+# requestBodyMode 规则加载校验：未与 POST 路由的显式 requestBody 一起
+# 出现，或取值不是区分大小写的 "exact"/"subset"，load_rules 抛
+# RulesError，CLI 退出码 2 且不监听
+INVALID_REQUEST_BODY_MODE_CASES = [
+    # (说明, 路由项, 非法项下标)
+    (
+        "POST 路由缺少 requestBody（位于 routes[0]）",
+        {"method": "POST", "path": "/p",
+         "requestBodyMode": "subset", "body": {}},
+        0,
+    ),
+    (
+        "POST 路由缺少 requestBody（合法路由之后的 routes[1]）",
+        {"method": "POST", "path": "/p",
+         "requestBodyMode": "exact", "body": {}},
+        1,
+    ),
+    (
+        "GET 路由携带 requestBodyMode（无 requestBody）",
+        {"method": "GET", "path": "/g",
+         "requestBodyMode": "subset", "body": {}},
+        0,
+    ),
+    (
+        "GET 路由同时携带 requestBody 与 requestBodyMode",
+        {"method": "GET", "path": "/g", "requestBody": {"v": 1},
+         "requestBodyMode": "subset", "body": {}},
+        0,
+    ),
+    (
+        "取值为小写开头的其他字符串",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": "sub", "body": {}},
+        0,
+    ),
+    (
+        "取值大小写不符（Subset）",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": "Subset", "body": {}},
+        0,
+    ),
+    (
+        "取值大小写不符（EXACT）",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": "EXACT", "body": {}},
+        0,
+    ),
+    (
+        "取值为 null",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": None, "body": {}},
+        0,
+    ),
+    (
+        "取值为布尔",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": True, "body": {}},
+        0,
+    ),
+    (
+        "取值为数字",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": 1, "body": {}},
+        0,
+    ),
+    (
+        "取值为数组",
+        {"method": "POST", "path": "/p", "requestBody": {"v": 1},
+         "requestBodyMode": ["subset"], "body": {}},
+        0,
+    ),
+]
+
+
+class RequestBodyModeRulesValidationTests(unittest.TestCase):
+    """requestBodyMode 只能与 POST 路由的显式 requestBody 一起出现。"""
+
+    def _items_for(self, bad_item, bad_index):
+        if bad_index == 0:
+            return [bad_item]
+        return [
+            {"method": "GET", "path": "/ok", "body": {"fine": 1}},
+            bad_item,
+        ]
+
+    def _write_invalid_rules(self, tmp, name, bad_item, bad_index):
+        return write_rules(
+            tmp, name, self._items_for(bad_item, bad_index)
+        )
+
+    def test_load_rules_rejects_invalid_request_body_mode(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_item, bad_index) in enumerate(
+                INVALID_REQUEST_BODY_MODE_CASES
+            ):
+                with self.subTest(样例=label):
+                    rules_path = self._write_invalid_rules(
+                        tmp, f"rules_bad_mode_{index}.json",
+                        bad_item, bad_index,
+                    )
+                    with self.assertRaises(
+                        RulesError,
+                        msg=f"样例 {label}: load_rules 应抛出 RulesError",
+                    ) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn(
+                        f"routes[{bad_index}].requestBodyMode", message,
+                        f"样例 {label}: 错误应标明 routes[{bad_index}]"
+                        f".requestBodyMode，实际 {message!r}",
+                    )
+
+    def test_cli_rejects_with_exit_code_2_and_location(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_item, bad_index) in enumerate(
+                INVALID_REQUEST_BODY_MODE_CASES
+            ):
+                with self.subTest(样例=label):
+                    rules_path = self._write_invalid_rules(
+                        tmp, f"rules_bad_mode_cli_{index}.json",
+                        bad_item, bad_index,
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        f"routes[{bad_index}].requestBodyMode", stderr,
+                        f"样例 {label}: 标准错误应包含路由位置与字段名，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn("Traceback", stderr)
+                    self.assertNotIn(STARTUP_MARKER, stdout)
+
+    def test_valid_modes_load(self):
+        # 省略、显式 "exact"、"subset" 均可加载；null 样例也算显式存在
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            routes = [
+                {"method": "POST", "path": "/omit",
+                 "requestBody": {"a": 1}, "body": {}},
+                {"method": "POST", "path": "/exact",
+                 "requestBody": {"a": 1}, "requestBodyMode": "exact",
+                 "body": {}},
+                {"method": "POST", "path": "/subset",
+                 "requestBody": {"a": 1}, "requestBodyMode": "subset",
+                 "body": {}},
+                {"method": "POST", "path": "/nullish",
+                 "requestBody": None, "requestBodyMode": "subset",
+                 "body": {}},
+            ]
+            rules_path = write_rules(tmp, "rules_modes_ok.json", routes)
+            loaded = load_rules(rules_path)
+            self.assertEqual(
+                loaded.request_body_modes[("POST", "/omit")], "exact"
+            )
+            self.assertEqual(
+                loaded.request_body_modes[("POST", "/exact")], "exact"
+            )
+            self.assertEqual(
+                loaded.request_body_modes[("POST", "/subset")], "subset"
+            )
+            self.assertEqual(
+                loaded.request_body_modes[("POST", "/nullish")], "subset"
+            )
+            self.assertIn(None, [loaded.request_bodies[("POST", "/nullish")]])
+
+
+class RequestBodyModeRemovalTests(unittest.TestCase):
+    """删除模式字段后，带额外键的正文应回到整体相等语义（400）。"""
+
+    def test_removing_mode_restores_exact_semantics(self):
+        sample = {"user": {"id": 1}, "tags": ["a"]}
+        route_with_mode = {
+            "method": "POST", "path": "/check",
+            "requestBody": sample, "requestBodyMode": "subset",
+            "body": {"accepted": True},
+        }
+        route_without_mode = {
+            "method": "POST", "path": "/check",
+            "requestBody": sample,
+            "body": {"accepted": True},
+        }
+        body_with_extra = (
+            b'{"user":{"id":1.0,"name":"\xe7\x94\xb2"},'
+            b'"tags":["a"],"trace":"demo"}'
+        )
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            with_mode = write_rules(
+                tmp, "rules_with_mode.json", [route_with_mode]
+            )
+            without_mode = write_rules(
+                tmp, "rules_without_mode.json", [route_without_mode]
+            )
+            port_a = free_port()
+            port_b = free_port()
+            subset_server = ServerProcess(with_mode, port_a)
+            exact_server = ServerProcess(without_mode, port_b)
+            try:
+                expectations = {port_a: 200, port_b: 400}
+                for port, expected in expectations.items():
+                    with self.subTest(port=port):
+                        status, headers, raw = request(
+                            port, "POST", "/check", body=body_with_extra
+                        )
+                        self.assertEqual(
+                            status, expected,
+                            f"端口 {port}: 期望 {expected}，实际 {status}",
+                        )
+                        if expected == 200:
+                            self.assertEqual(raw, b'{"accepted":true}')
+                        else:
+                            self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+            finally:
+                subset_server.stop()
+                exact_server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

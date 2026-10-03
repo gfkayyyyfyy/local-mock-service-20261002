@@ -13,6 +13,9 @@ NOT_FOUND_BODY = b'{"error":"route_not_found"}'
 METHOD_NOT_SUPPORTED_BODY = b'{"error":"method_not_supported"}'
 REQUEST_BODY_MISMATCH_BODY = b'{"error":"request_body_mismatch"}'
 CONTENT_TYPE = "application/json; charset=utf-8"
+# requestBodyMode 的合法取值：省略或 "exact" 为原有的整体相等比较，
+# "subset" 启用对象子集匹配；取值区分大小写
+REQUEST_BODY_MODES = ("exact", "subset")
 
 
 class RulesError(Exception):
@@ -53,7 +56,9 @@ class Routes(dict):
 
     delays 为 {(method, path): int}，缺省或为 0 的路由不增加人为等待；
     request_bodies 为 {(method, path): 样例值}，仅含显式配置 requestBody
-    的 POST 路由，键不存在表示该路由忽略请求正文。
+    的 POST 路由，键不存在表示该路由忽略请求正文；
+    request_body_modes 为 {(method, path): "exact"|"subset"}，键集合与
+    request_bodies 一致，缺省 requestBodyMode 时记为 "exact"。
     """
 
 
@@ -128,13 +133,63 @@ def _json_equal(expected, actual):
     return True
 
 
+def _json_subset(expected, actual):
+    """对象子集匹配：样例对象的所有键都须存在于实际值的对应对象中，
+    对应值递归按同一模式比较，实际对象允许出现额外键（空对象样例因此
+    匹配任意对象，但也只匹配对象）。数组仍要求相同长度与顺序（不接受
+    前缀匹配），其中元素为对象时同样允许额外键。其余值与 _json_equal
+    语义一致：数字按数值比较（1 与 1.0 相等）、布尔与数字不等、字符串
+    区分大小写、None 只匹配 None、类型不符即不匹配。
+    """
+    stack = [(expected, actual)]
+    while stack:
+        want, got = stack.pop()
+        if want is None or got is None:
+            if want is not got:
+                return False
+            continue
+        # bool 是 int 的子类，须在数字比较之前显式区分
+        if isinstance(want, bool) or isinstance(got, bool):
+            if type(want) is not type(got) or want != got:
+                return False
+            continue
+        if isinstance(want, (int, float)):
+            if not isinstance(got, (int, float)) or isinstance(got, bool):
+                return False
+            if want != got:
+                return False
+            continue
+        if isinstance(want, str):
+            if type(got) is not str or want != got:
+                return False
+            continue
+        if isinstance(want, list):
+            if type(got) is not list or len(want) != len(got):
+                return False
+            for index in range(len(want) - 1, -1, -1):
+                stack.append((want[index], got[index]))
+            continue
+        if isinstance(want, dict):
+            if type(got) is not dict or not set(want) <= set(got):
+                return False
+            for key in want:
+                stack.append((want[key], got[key]))
+            continue
+        # json 解析结果只会是 None/bool/int/float/str/list/dict
+        if want != got:
+            return False
+    return True
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 Routes：{(method, path): (状态码, 响应字节)}。
 
     返回值的 delays 属性为 {(method, path): 延迟毫秒数} 映射；
     request_bodies 属性为 {(method, path): requestBody 样例值} 映射，
     仅包含显式配置 requestBody 的 POST 路由（样例可以是 None，对应显式
-    JSON null，故以键是否存在而非值是否为 None 区分）。
+    JSON null，故以键是否存在而非值是否为 None 区分）；
+    request_body_modes 属性为 {(method, path): "exact"|"subset"} 映射，
+    键集合与 request_bodies 一致。
     """
     try:
         with open(path, "rb") as f:
@@ -163,6 +218,7 @@ def load_rules(path):
     routes = Routes()
     routes.delays = {}
     routes.request_bodies = {}
+    routes.request_body_modes = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -190,6 +246,21 @@ def load_rules(path):
         if key in routes:
             raise RulesError(f"{where}: duplicate route {method} {route_path}")
         request_body_sample = None
+        if "requestBodyMode" in item:
+            # 只允许与 POST 路由的显式 requestBody 一起出现（requestBody
+            # 为 null 也算显式存在）；取值必须是区分大小写的 "exact" 或
+            # "subset"，其他值一律拒绝
+            if method != "POST" or "requestBody" not in item:
+                raise RulesError(
+                    f"{where}.requestBodyMode is only allowed together with "
+                    f"an explicit requestBody on a POST route"
+                )
+            mode = item["requestBodyMode"]
+            if mode not in REQUEST_BODY_MODES:
+                raise RulesError(
+                    f"{where}.requestBodyMode must be 'exact' or 'subset', "
+                    f"got {mode!r}"
+                )
         if "requestBody" in item:
             if method != "POST":
                 raise RulesError(
@@ -236,6 +307,7 @@ def load_rules(path):
         routes.delays[key] = delay_ms
         if "requestBody" in item:
             routes.request_bodies[key] = request_body_sample
+            routes.request_body_modes[key] = item.get("requestBodyMode", "exact")
     return routes
 
 
@@ -261,9 +333,10 @@ def _make_handler(routes):
             return b"".join(chunks)
 
         @staticmethod
-        def _body_matches(sample, raw):
+        def _body_matches(sample, raw, mode):
             # 空正文、非法 UTF-8、JSON 语法错误、NaN/Infinity 等非标准
-            # 字面量、溢出为 inf/-inf 的数字或递归比较不通过，均视为不匹配
+            # 字面量、溢出为 inf/-inf 的数字或递归比较不通过，均视为不匹配；
+            # 完整正文先通过全部解析检查，再按模式比较（额外字段不能绕过检查）
             if raw is None:
                 return False
             try:
@@ -278,6 +351,8 @@ def _make_handler(routes):
                 _ensure_finite_numbers(data)
             except ValueError:
                 return False
+            if mode == "subset":
+                return _json_subset(sample, data)
             return _json_equal(sample, data)
 
         def _respond(self):
@@ -290,7 +365,9 @@ def _make_handler(routes):
                 self._send(404, NOT_FOUND_BODY)
                 return
             if key in routes.request_bodies and not self._body_matches(
-                routes.request_bodies[key], raw_body
+                routes.request_bodies[key],
+                raw_body,
+                routes.request_body_modes.get(key, "exact"),
             ):
                 # 请求体不匹配：不应用配置的状态、正文或延迟
                 self._send(400, REQUEST_BODY_MISMATCH_BODY)
