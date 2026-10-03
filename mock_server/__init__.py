@@ -4,16 +4,30 @@ import argparse
 import json
 import math
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 ALLOWED_METHODS = ("GET", "POST")
 NOT_FOUND_BODY = b'{"error":"route_not_found"}'
 CONTENT_TYPE = "application/json; charset=utf-8"
+MAX_DELAY_MS = 2000
 
 
 class RulesError(Exception):
     """规则文件无法加载或内容非法。"""
+
+
+class RouteMap(dict):
+    """{(method, path): (status, body)} 路由表，附带 {key: 延迟毫秒} 的 delays。
+
+    与普通 dict 相等性一致（delays 不参与比较），未配置 delayMs 的旧规则
+    加载结果保持原样。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.delays = {}
 
 
 def _port(value):
@@ -35,6 +49,13 @@ def _valid_status(value):
     if not isinstance(value, int) or isinstance(value, bool):
         return False
     return value == 200 or 400 <= value <= 599
+
+
+def _valid_delay(value):
+    # 与 status 同理排除 bool；200.0 等浮点数、null、字符串、数组、对象均非法
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return 0 <= value <= MAX_DELAY_MS
 
 
 def _reject_constant(value):
@@ -62,7 +83,8 @@ def _ensure_finite_numbers(data):
 
 
 def load_rules(path):
-    """加载并校验规则文件，返回 {(method, path): (状态码, 响应字节)} 字典。"""
+    """加载并校验规则文件，返回 RouteMap：{(method, path): (状态码, 响应字节)}，
+    其 delays 属性保存各路由的固定延迟毫秒数（仅记录大于 0 的项）。"""
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -87,7 +109,7 @@ def load_rules(path):
     if not isinstance(data, dict) or not isinstance(data.get("routes"), list):
         raise RulesError("rules file must be a JSON object with a 'routes' array")
 
-    routes = {}
+    routes = RouteMap()
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -120,6 +142,12 @@ def load_rules(path):
                 f"{where}: status must be the integer 200 or an integer "
                 f"between 400 and 599, got {status!r}"
             )
+        delay = item.get("delayMs", 0)
+        if not _valid_delay(delay):
+            raise RulesError(
+                f"{where}: delayMs must be an integer between 0 and "
+                f"{MAX_DELAY_MS}, got {delay!r}"
+            )
         try:
             body = json.dumps(
                 item["body"], ensure_ascii=False, separators=(",", ":")
@@ -132,10 +160,14 @@ def load_rules(path):
                 f"{where}.body cannot be encoded as UTF-8: {exc}"
             )
         routes[key] = (status, body)
+        if delay:
+            routes.delays[key] = delay
     return routes
 
 
 def _make_handler(routes):
+    delays = getattr(routes, "delays", {})
+
     class MockHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -154,10 +186,16 @@ def _make_handler(routes):
         def _respond(self):
             self._discard_body()
             path = urlsplit(self.path).path
-            entry = routes.get((self.command, path))
+            key = (self.command, path)
+            entry = routes.get(key)
             if entry is None:
                 self._send(404, NOT_FOUND_BODY)
             else:
+                # 请求体已读完且命中路由：每次命中（含错误状态路由）都先
+                # 等待配置的固定延迟，再发送状态行、响应头与响应体
+                delay = delays.get(key, 0)
+                if delay:
+                    time.sleep(delay / 1000)
                 self._send(entry[0], entry[1])
 
         def _send(self, status, body):
