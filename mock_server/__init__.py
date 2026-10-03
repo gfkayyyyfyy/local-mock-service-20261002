@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -37,6 +38,21 @@ def _valid_status(value):
     return value == 200 or 400 <= value <= 599
 
 
+def _valid_delay_ms(value):
+    # 与 status 同理排除 bool；200.0 等浮点数、null、字符串、数组、
+    # 对象以及负数或大于 2000 的整数均不接受
+    if not isinstance(value, int) or isinstance(value, bool):
+        return False
+    return 0 <= value <= 2000
+
+
+class Routes(dict):
+    """{(method, path): (status, body)} 映射，附带每条路由的延迟毫秒数。
+
+    delays 为 {(method, path): int}，缺省或为 0 的路由不增加人为等待。
+    """
+
+
 def _reject_constant(value):
     # json.loads 默认接受 NaN/Infinity/-Infinity 三种非标准数字字面量，
     # 它们不是合法 JSON；无论在文档何处出现都视为格式错误
@@ -62,7 +78,10 @@ def _ensure_finite_numbers(data):
 
 
 def load_rules(path):
-    """加载并校验规则文件，返回 {(method, path): (状态码, 响应字节)} 字典。"""
+    """加载并校验规则文件，返回 Routes：{(method, path): (状态码, 响应字节)}。
+
+    返回值的 delays 属性为 {(method, path): 延迟毫秒数} 映射。
+    """
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -87,7 +106,8 @@ def load_rules(path):
     if not isinstance(data, dict) or not isinstance(data.get("routes"), list):
         raise RulesError("rules file must be a JSON object with a 'routes' array")
 
-    routes = {}
+    routes = Routes()
+    routes.delays = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -120,6 +140,12 @@ def load_rules(path):
                 f"{where}: status must be the integer 200 or an integer "
                 f"between 400 and 599, got {status!r}"
             )
+        delay_ms = item.get("delayMs", 0)
+        if not _valid_delay_ms(delay_ms):
+            raise RulesError(
+                f"{where}: delayMs must be an integer between 0 and 2000 "
+                f"(inclusive), got {delay_ms!r}"
+            )
         try:
             body = json.dumps(
                 item["body"], ensure_ascii=False, separators=(",", ":")
@@ -132,6 +158,7 @@ def load_rules(path):
                 f"{where}.body cannot be encoded as UTF-8: {exc}"
             )
         routes[key] = (status, body)
+        routes.delays[key] = delay_ms
     return routes
 
 
@@ -154,10 +181,16 @@ def _make_handler(routes):
         def _respond(self):
             self._discard_body()
             path = urlsplit(self.path).path
-            entry = routes.get((self.command, path))
+            key = (self.command, path)
+            entry = routes.get(key)
             if entry is None:
                 self._send(404, NOT_FOUND_BODY)
             else:
+                # 请求体已读完且路由已命中：每次命中（含错误状态码路由）
+                # 都先等待配置的时长，再发送状态行、响应头与响应体
+                delay_ms = routes.delays.get(key, 0)
+                if delay_ms:
+                    time.sleep(delay_ms / 1000)
                 self._send(entry[0], entry[1])
 
         def _send(self, status, body):

@@ -1648,5 +1648,300 @@ class ValidRootPathControlTests(unittest.TestCase):
                 server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 路由级固定响应延迟（delayMs）回归
+# ---------------------------------------------------------------------------
+
+# 行为测试使用的延迟配置：200ms 足以与本地回环的正常往返（毫秒级）区分
+DELAY_MS = 200
+DELAY_SECONDS = DELAY_MS / 1000
+# 下限留少量时钟粒度余量；上限要求未配置延迟的路由远快于 DELAY_MS
+DELAY_MIN_SECONDS = DELAY_SECONDS - 0.02
+NO_DELAY_MAX_SECONDS = DELAY_SECONDS - 0.05
+
+
+def timed_request(port, method, target, body=None):
+    """发起请求并返回 (状态码, 响应头, 响应体字节, 到收到响应头的耗时秒数)。
+
+    耗时从发送请求前量到响应状态行与响应头接收完毕，即“响应开始”的时刻。
+    """
+    conn = HTTPConnection("127.0.0.1", port, timeout=REQUEST_TIMEOUT)
+    try:
+        start = time.monotonic()
+        conn.request(method, target, body=body)
+        resp = conn.getresponse()
+        elapsed = time.monotonic() - start
+        raw = resp.read()
+        headers = {k: v for k, v in resp.getheaders()}
+        return resp.status, headers, raw, elapsed
+    finally:
+        conn.close()
+
+
+class DelayBehaviorTests(unittest.TestCase):
+    """delayMs 命中即等待：每次请求、错误状态码与配置的 404 都先等后答。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name,
+            "rules_delay.json",
+            [
+                {"method": "GET", "path": "/hello",
+                 "body": {"message": "你好"}},
+                {"method": "GET", "path": "/slow", "delayMs": DELAY_MS,
+                 "status": 503, "body": {"error": "demo_failure"}},
+                {"method": "GET", "path": "/slow404", "delayMs": DELAY_MS,
+                 "status": 404, "body": {"error": "configured_missing"}},
+            ],
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def test_delayed_route_waits_then_returns_configured_error(self):
+        # GET /slow?x=1：完整发送请求后至少 DELAY_MS 才收到响应开始，
+        # 最终得到配置的 503 与 body；查询串不影响匹配
+        for attempt in (1, 2):
+            with self.subTest(第几次请求=attempt):
+                status, headers, raw, elapsed = timed_request(
+                    self.port, "GET", "/slow?x=1"
+                )
+                self.assertGreaterEqual(
+                    elapsed, DELAY_MIN_SECONDS,
+                    f"第 {attempt} 次请求：响应开始应不早于 {DELAY_MS}ms，"
+                    f"实际 {elapsed * 1000:.1f}ms（每次命中都应应用延迟）",
+                )
+                self.assertEqual(status, 503)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"error": "demo_failure"}
+                )
+
+    def test_routes_without_delay_respond_promptly(self):
+        # /hello 与未命中的 /missing 不增加人为等待
+        for label, target, expected_status, expected_body in [
+            ("GET /hello", "/hello", 200, {"message": "你好"}),
+            ("GET /missing（未命中）", "/missing", 404,
+             {"error": "route_not_found"}),
+        ]:
+            with self.subTest(样例=label):
+                status, headers, raw, elapsed = timed_request(
+                    self.port, "GET", target
+                )
+                self.assertLess(
+                    elapsed, NO_DELAY_MAX_SECONDS,
+                    f"{label}: 不应增加人为等待，实际耗时 "
+                    f"{elapsed * 1000:.1f}ms",
+                )
+                self.assertEqual(status, expected_status)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), expected_body
+                )
+
+    def test_configured_404_with_delay_waits_then_returns_own_body(self):
+        # 命中配置了 404 的路由：先等待，再返回它自己的 body
+        status, headers, raw, elapsed = timed_request(
+            self.port, "GET", "/slow404"
+        )
+        self.assertGreaterEqual(
+            elapsed, DELAY_MIN_SECONDS,
+            f"配置的 404 也应先等待 {DELAY_MS}ms，实际 {elapsed * 1000:.1f}ms",
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), {"error": "configured_missing"}
+        )
+
+    def test_delay_applied_on_keep_alive_connection(self):
+        # 同一 HTTP/1.1 连接上后续请求命中延迟路由时仍逐次等待
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=REQUEST_TIMEOUT)
+        try:
+            for attempt in (1, 2):
+                with self.subTest(第几次请求=attempt):
+                    start = time.monotonic()
+                    conn.request("GET", "/slow")
+                    resp = conn.getresponse()
+                    elapsed = time.monotonic() - start
+                    raw = resp.read()
+                    self.assertGreaterEqual(
+                        elapsed, DELAY_MIN_SECONDS,
+                        f"keep-alive 第 {attempt} 次请求仍应等待 "
+                        f"{DELAY_MS}ms，实际 {elapsed * 1000:.1f}ms",
+                    )
+                    self.assertEqual(resp.status, 503)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"error": "demo_failure"},
+                    )
+        finally:
+            conn.close()
+
+
+INVALID_DELAY_CASES = [
+    # (说明, 非法 delayMs 的 JSON 值)
+    ("null", None),
+    ("布尔 true", True),
+    ("布尔 false", False),
+    ('字符串 "200"', "200"),
+    ("浮点数 200.0", 200.0),
+    ("浮点数 0.5", 0.5),
+    ("空数组 []", []),
+    ("空对象 {}", {}),
+    ("负数 -1", -1),
+    ("大于上限 2001", 2001),
+]
+
+
+class InvalidDelayMsTests(unittest.TestCase):
+    """非法 delayMs：load_rules 抛 RulesError，CLI 退出码 2 且不监听。"""
+
+    def _write_case(self, tmp, name, bad_delay, bad_index):
+        # 非法项分别位于 routes[0] 与一条合法路由之后的 routes[1]
+        bad_item = {
+            "method": "GET",
+            "path": "/slow",
+            "delayMs": bad_delay,
+            "status": 503,
+            "body": {"error": "demo_failure"},
+        }
+        items = [bad_item] if bad_index == 0 else [
+            {"method": "GET", "path": "/ok", "body": {"fine": 1}},
+            bad_item,
+        ]
+        return write_rules(tmp, name, items)
+
+    def test_load_rules_raises_rules_error(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            seq = 0
+            for label, bad_delay in INVALID_DELAY_CASES:
+                for bad_index in (0, 1):
+                    with self.subTest(样例=label, 位置=f"routes[{bad_index}]"):
+                        rules_path = self._write_case(
+                            tmp, f"rules_delay_{seq}.json", bad_delay, bad_index
+                        )
+                        seq += 1
+                        with self.assertRaises(
+                            RulesError,
+                            msg=f"样例 {label!r} @ routes[{bad_index}]: "
+                                f"load_rules 应抛出 RulesError",
+                        ) as ctx:
+                            load_rules(rules_path)
+                        message = str(ctx.exception)
+                        self.assertIn(
+                            f"routes[{bad_index}]", message,
+                            f"样例 {label!r}: 错误应标明实际下标 "
+                            f"routes[{bad_index}]，实际消息={message!r}",
+                        )
+                        self.assertIn(
+                            "delayMs", message,
+                            f"样例 {label!r}: 错误应包含 delayMs 的原因，"
+                            f"实际消息={message!r}",
+                        )
+
+    def test_cli_rejects_invalid_delay_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            seq = 0
+            for label, bad_delay in INVALID_DELAY_CASES:
+                for bad_index in (0, 1):
+                    with self.subTest(样例=label, 位置=f"routes[{bad_index}]"):
+                        rules_path = self._write_case(
+                            tmp, f"rules_delay_cli_{seq}.json",
+                            bad_delay, bad_index,
+                        )
+                        seq += 1
+                        returncode, stdout, stderr = start_and_wait_exit(
+                            rules_path, free_port()
+                        )
+                        self.assertEqual(
+                            returncode, 2,
+                            f"样例 {label!r} @ routes[{bad_index}]: 期望退出码 "
+                            f"2，实际 {returncode}；stdout={stdout!r} "
+                            f"stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            f"routes[{bad_index}]", stderr,
+                            f"样例 {label!r}: 标准错误应标明实际下标 "
+                            f"routes[{bad_index}]，实际 stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            "delayMs", stderr,
+                            f"样例 {label!r}: 标准错误应包含 delayMs 的原因，"
+                            f"实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            "Traceback", stderr,
+                            f"样例 {label!r}: 不应出现 Python 异常回溯，"
+                            f"实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn(
+                            STARTUP_MARKER, stdout,
+                            f"样例 {label!r}: 校验失败时标准输出不应出现监听"
+                            f"提示，实际 stdout={stdout!r}",
+                        )
+
+
+class DelayBoundaryTests(unittest.TestCase):
+    """合法边界：delayMs 为 0 或 2000 均可加载；缺省与 0 不增加等待。"""
+
+    def test_boundary_values_load(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_delay_boundary.json",
+                [
+                    {"method": "GET", "path": "/zero", "delayMs": 0,
+                     "body": {"d": 0}},
+                    {"method": "GET", "path": "/max", "delayMs": 2000,
+                     "body": {"d": 2000}},
+                    {"method": "GET", "path": "/absent",
+                     "body": {"d": None}},
+                ],
+            )
+            routes = load_rules(rules_path)
+            self.assertEqual(
+                set(routes),
+                {("GET", "/zero"), ("GET", "/max"), ("GET", "/absent")},
+            )
+            self.assertEqual(routes.delays[("GET", "/zero")], 0)
+            self.assertEqual(routes.delays[("GET", "/max")], 2000)
+            self.assertEqual(routes.delays[("GET", "/absent")], 0)
+
+    def test_zero_and_absent_delay_add_no_wait(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_delay_zero.json",
+                [
+                    {"method": "GET", "path": "/zero", "delayMs": 0,
+                     "body": {"d": 0}},
+                    {"method": "GET", "path": "/absent", "body": {"d": None}},
+                ],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                for target in ("/zero", "/absent"):
+                    with self.subTest(path=target):
+                        status, headers, raw, elapsed = timed_request(
+                            port, "GET", target
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertLess(
+                            elapsed, NO_DELAY_MAX_SECONDS,
+                            f"GET {target}: delayMs 缺省或为 0 不应增加等待，"
+                            f"实际 {elapsed * 1000:.1f}ms",
+                        )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
