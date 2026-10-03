@@ -9,6 +9,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 ALLOWED_METHODS = ("GET", "POST")
+REQUEST_BODY_MODE_EXACT = "exact"
+REQUEST_BODY_MODE_SUBSET = "subset"
+REQUEST_BODY_MODES = (REQUEST_BODY_MODE_EXACT, REQUEST_BODY_MODE_SUBSET)
 NOT_FOUND_BODY = b'{"error":"route_not_found"}'
 METHOD_NOT_SUPPORTED_BODY = b'{"error":"method_not_supported"}'
 REQUEST_BODY_MISMATCH_BODY = b'{"error":"request_body_mismatch"}'
@@ -53,7 +56,10 @@ class Routes(dict):
 
     delays 为 {(method, path): int}，缺省或为 0 的路由不增加人为等待；
     request_bodies 为 {(method, path): 样例值}，仅含显式配置 requestBody
-    的 POST 路由，键不存在表示该路由忽略请求正文。
+    的 POST 路由，键不存在表示该路由忽略请求正文；
+    request_body_modes 为 {(method, path): "exact"|"subset"}，仅含显式
+    配置 requestBody 的 POST 路由，缺省 "exact" 表示完整 JSON 相等，
+    "subset" 表示对象允许额外键的递归子集匹配。
     """
 
 
@@ -128,13 +134,70 @@ def _json_equal(expected, actual):
     return True
 
 
+def _json_subset_equal(expected, actual):
+    """subset 模式下递归判断 actual 是否包含 expected 的对象子集。
+
+    与 _json_equal 的区别仅在对象：样例对象的每个键都必须存在于请求对象
+    中且值递归按同一模式比较，请求对象允许携带额外键；空对象只匹配对象。
+    数组仍按相同长度与逐元素顺序比较（不接受前缀匹配），数组元素中的
+    对象同样允许额外键；None/bool/数字/字符串等其余值沿用 _json_equal
+    的比较语义（1 与 1.0 相等、布尔与数字不等、字符串区分大小写、
+    None 只匹配 None、类型不同即不匹配）。
+    """
+    stack = [(expected, actual)]
+    while stack:
+        want, got = stack.pop()
+        if want is None or got is None:
+            if want is not got:
+                return False
+            continue
+        # bool 是 int 的子类，须在数字比较之前显式区分
+        if isinstance(want, bool) or isinstance(got, bool):
+            if type(want) is not type(got) or want != got:
+                return False
+            continue
+        if isinstance(want, (int, float)):
+            if not isinstance(got, (int, float)) or isinstance(got, bool):
+                return False
+            if want != got:
+                return False
+            continue
+        if isinstance(want, str):
+            if type(got) is not str or want != got:
+                return False
+            continue
+        if isinstance(want, list):
+            # 数组不接受前缀匹配：长度与逐元素顺序必须一致，元素按
+            # subset 模式递归比较（其中的对象允许额外键）
+            if type(got) is not list or len(want) != len(got):
+                return False
+            for index in range(len(want) - 1, -1, -1):
+                stack.append((want[index], got[index]))
+            continue
+        if isinstance(want, dict):
+            # 空对象只匹配对象；样例键必须全部存在，额外键不参与比较
+            if type(got) is not dict:
+                return False
+            for key in want:
+                if key not in got:
+                    return False
+                stack.append((want[key], got[key]))
+            continue
+        # json 解析结果只会是 None/bool/int/float/str/list/dict
+        if want != got:
+            return False
+    return True
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 Routes：{(method, path): (状态码, 响应字节)}。
 
     返回值的 delays 属性为 {(method, path): 延迟毫秒数} 映射；
     request_bodies 属性为 {(method, path): requestBody 样例值} 映射，
     仅包含显式配置 requestBody 的 POST 路由（样例可以是 None，对应显式
-    JSON null，故以键是否存在而非值是否为 None 区分）。
+    JSON null，故以键是否存在而非值是否为 None 区分）；
+    request_body_modes 属性为 {(method, path): "exact"|"subset"} 映射，
+    与 request_bodies 同键，缺省 "exact"。
     """
     try:
         with open(path, "rb") as f:
@@ -163,6 +226,7 @@ def load_rules(path):
     routes = Routes()
     routes.delays = {}
     routes.request_bodies = {}
+    routes.request_body_modes = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -190,7 +254,8 @@ def load_rules(path):
         if key in routes:
             raise RulesError(f"{where}: duplicate route {method} {route_path}")
         request_body_sample = None
-        if "requestBody" in item:
+        has_request_body = "requestBody" in item
+        if has_request_body:
             if method != "POST":
                 raise RulesError(
                     f"{where}.requestBody is only allowed on POST routes, "
@@ -209,6 +274,27 @@ def load_rules(path):
                     f"{where}.requestBody cannot be encoded as UTF-8: {exc}"
                 )
             request_body_sample = item["requestBody"]
+        # requestBodyMode 只能与显式 requestBody 一起用于 POST 路由；
+        # null 样例也算存在，但 GET 路由、缺少样例或非法取值均拒绝加载。
+        # 省略时保持原行为（"exact"）
+        request_body_mode = REQUEST_BODY_MODE_EXACT
+        if "requestBodyMode" in item:
+            request_body_mode = item["requestBodyMode"]
+            if method != "POST":
+                raise RulesError(
+                    f"{where}.requestBodyMode is only allowed on POST routes, "
+                    f"got method {method!r}"
+                )
+            if not has_request_body:
+                raise RulesError(
+                    f"{where}.requestBodyMode requires an explicit "
+                    f"requestBody sample on the same route"
+                )
+            if request_body_mode not in REQUEST_BODY_MODES:
+                raise RulesError(
+                    f"{where}.requestBodyMode must be 'exact' or 'subset', "
+                    f"got {request_body_mode!r}"
+                )
         status = item.get("status", 200)
         if not _valid_status(status):
             raise RulesError(
@@ -234,8 +320,9 @@ def load_rules(path):
             )
         routes[key] = (status, body)
         routes.delays[key] = delay_ms
-        if "requestBody" in item:
+        if has_request_body:
             routes.request_bodies[key] = request_body_sample
+            routes.request_body_modes[key] = request_body_mode
     return routes
 
 
@@ -261,9 +348,11 @@ def _make_handler(routes):
             return b"".join(chunks)
 
         @staticmethod
-        def _body_matches(sample, raw):
+        def _body_matches(sample, raw, mode):
             # 空正文、非法 UTF-8、JSON 语法错误、NaN/Infinity 等非标准
-            # 字面量、溢出为 inf/-inf 的数字或递归比较不通过，均视为不匹配
+            # 字面量、溢出为 inf/-inf 的数字或递归比较不通过，均视为不匹配。
+            # 完整正文先通过上述全部检查后才按 exact/subset 模式比较，
+            # 因此额外字段不能绕过 UTF-8、语法与非有限数字检查。
             if raw is None:
                 return False
             try:
@@ -278,6 +367,8 @@ def _make_handler(routes):
                 _ensure_finite_numbers(data)
             except ValueError:
                 return False
+            if mode == REQUEST_BODY_MODE_SUBSET:
+                return _json_subset_equal(sample, data)
             return _json_equal(sample, data)
 
         def _respond(self):
@@ -290,7 +381,9 @@ def _make_handler(routes):
                 self._send(404, NOT_FOUND_BODY)
                 return
             if key in routes.request_bodies and not self._body_matches(
-                routes.request_bodies[key], raw_body
+                routes.request_bodies[key],
+                raw_body,
+                routes.request_body_modes[key],
             ):
                 # 请求体不匹配：不应用配置的状态、正文或延迟
                 self._send(400, REQUEST_BODY_MISMATCH_BODY)
