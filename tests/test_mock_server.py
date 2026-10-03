@@ -2520,5 +2520,132 @@ class MethodNotSupportedTests(unittest.TestCase):
         self.assertNotIn("你好".encode("utf-8"), data)
 
 
+# ---------------------------------------------------------------------------
+# 规则文件生命周期回归
+#
+# README 约定：规则仅在启动时加载一次，之后修改文件不影响响应。下列用例
+# 固定这份约定：同一临时规则文件经历 改写为有效更新 -> 破坏为非法 JSON ->
+# 删除 之后，已启动的服务仍返回初始响应且不退出；只有在同一路径恢复有效
+# 规则并重新启动后，新进程才按当前文件内容响应。文件变化与请求按顺序发生，
+# 不依赖文件时间戳精度。
+# ---------------------------------------------------------------------------
+
+
+class RulesFileLifecycleTests(unittest.TestCase):
+    """运行期间改写、破坏、删除规则文件均不影响已启动服务的响应。"""
+
+    INITIAL_RULES_TEXT = (
+        '{"routes":[{"method":"GET","path":"/snapshot",'
+        '"body":{"version":"初始"}}]}'
+    )
+    UPDATED_RULES_TEXT = (
+        '{"routes":[{"method":"GET","path":"/snapshot","status":503,'
+        '"body":{"version":"更新"}}]}'
+    )
+    INITIAL_STATUS = 200
+    INITIAL_BODY = {"version": "初始"}
+    UPDATED_STATUS = 503
+    UPDATED_BODY = {"version": "更新"}
+
+    def _assert_snapshot(self, stage, port, expected_status, expected_body):
+        """核对 GET /snapshot 的状态码、完整 JSON 正文与响应头。"""
+        status, headers, raw = request(port, "GET", "/snapshot")
+        self.assertEqual(
+            status, expected_status,
+            f"阶段 {stage}: 状态码应为 {expected_status}，实际 {status}",
+        )
+        content_type = headers.get("Content-Type")
+        self.assertEqual(
+            content_type, CONTENT_TYPE,
+            f"阶段 {stage}: Content-Type 应为 {CONTENT_TYPE!r}，"
+            f"实际 {content_type!r}",
+        )
+        content_length = headers.get("Content-Length")
+        self.assertIsNotNone(
+            content_length, f"阶段 {stage}: 缺少 Content-Length"
+        )
+        self.assertEqual(
+            int(content_length), len(raw),
+            f"阶段 {stage}: Content-Length={content_length} "
+            f"与实际响应体字节数 {len(raw)} 不符",
+        )
+        # 中文正文按 UTF-8 编码的紧凑 JSON，逐字节核对
+        expected_raw = json.dumps(
+            expected_body, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        self.assertEqual(
+            raw, expected_raw,
+            f"阶段 {stage}: 响应字节应为 {expected_raw!r}，实际 {raw!r}",
+        )
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), expected_body,
+            f"阶段 {stage}: 响应 JSON 应为 {expected_body}，"
+            f"实际 {json.loads(raw.decode('utf-8'))}",
+        )
+
+    def _assert_server_alive(self, server, stage):
+        self.assertIsNone(
+            server.proc.poll(),
+            f"阶段 {stage}: 规则文件变化不应导致服务退出",
+        )
+
+    def test_running_server_ignores_file_changes_until_restart(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules_text(
+                tmp, "rules_snapshot.json", self.INITIAL_RULES_TEXT
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                # 阶段 1：初始启动，返回初始规则
+                self._assert_snapshot(
+                    "初始启动后", port,
+                    self.INITIAL_STATUS, self.INITIAL_BODY,
+                )
+
+                # 阶段 2：同一路径改写为有效的更新规则（503 + 更新正文），
+                # 原服务仍返回启动时加载的初始响应
+                rules_path.write_bytes(
+                    self.UPDATED_RULES_TEXT.encode("utf-8")
+                )
+                self._assert_snapshot(
+                    "改写为有效更新规则后", port,
+                    self.INITIAL_STATUS, self.INITIAL_BODY,
+                )
+                self._assert_server_alive(server, "改写为有效更新规则后")
+
+                # 阶段 3：破坏为只有一个左花括号的非法 JSON，
+                # 原服务不退出、不返回加载错误，仍返回初始响应
+                rules_path.write_bytes(b"{")
+                self._assert_snapshot(
+                    "破坏为非法 JSON 后", port,
+                    self.INITIAL_STATUS, self.INITIAL_BODY,
+                )
+                self._assert_server_alive(server, "破坏为非法 JSON 后")
+
+                # 阶段 4：删除规则文件，原服务仍返回初始响应
+                rules_path.unlink()
+                self._assert_snapshot(
+                    "删除规则文件后", port,
+                    self.INITIAL_STATUS, self.INITIAL_BODY,
+                )
+                self._assert_server_alive(server, "删除规则文件后")
+            finally:
+                server.stop()
+
+            # 阶段 5：同一路径恢复有效的更新规则，重新启动后新进程
+            # 读取当前文件，返回 503 与更新正文（同一端口可重新绑定，
+            # 也证明原进程已完全释放）
+            rules_path.write_bytes(self.UPDATED_RULES_TEXT.encode("utf-8"))
+            restarted = ServerProcess(rules_path, port)
+            try:
+                self._assert_snapshot(
+                    "恢复更新规则并重新启动后", port,
+                    self.UPDATED_STATUS, self.UPDATED_BODY,
+                )
+            finally:
+                restarted.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
