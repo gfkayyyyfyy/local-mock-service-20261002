@@ -40,7 +40,8 @@ UTF-8 编码的 JSON，顶层为对象，含 `routes` 数组；每项为含 `met
 - 匹配时忽略查询字符串和请求体；路径的大小写、尾部斜杠、百分号转义按原样比较。
 - `GET` / `POST` 命中：返回配置的 `status`（缺省 200）及配置的 `body`。
 - 未命中：返回 HTTP 404 及 `{"error":"route_not_found"}`（即使某条已命中路由自身配置了 404，也按命中处理并返回其 `body`）。
-- 其他 HTTP 方法不予处理（返回 501）。
+- 其他 HTTP 方法（`PUT`、`DELETE`、`OPTIONS`、`HEAD` 等）一律返回 HTTP 501 及 `{"error":"method_not_supported"}`，与目标路径是否存在、是否附带查询字符串或请求体无关，不使用该路径下已有规则的 `body`、`status` 或 `delayMs`。响应含 `Connection: close` 并在响应结束后关闭当前连接，请求体不会被当作后续请求继续解释。
+- `HEAD` 同样返回 501 与相同的响应头约定（含 `Content-Type` 与表示该 JSON 正文字节数的 `Content-Length`），但遵守 HEAD 语义不发送正文。
 - 所有响应均为 UTF-8 JSON，`Content-Type: application/json; charset=utf-8`，`Content-Length` 为实际字节数。
 
 ## 示例

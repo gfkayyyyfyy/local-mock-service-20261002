@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 ALLOWED_METHODS = ("GET", "POST")
 NOT_FOUND_BODY = b'{"error":"route_not_found"}'
+METHOD_NOT_SUPPORTED_BODY = b'{"error":"method_not_supported"}'
 CONTENT_TYPE = "application/json; charset=utf-8"
 
 
@@ -199,6 +200,32 @@ def _make_handler(routes):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _reject_method(self):
+            # 语法有效的 HTTP/1.1 请求但方法不受支持：与路径、查询字符串
+            # 及规则内容无关，一律返回固定 501 JSON，不应用任何规则的
+            # body、status 或 delayMs。先读掉请求体，避免连接关闭时客户端
+            # 仍在发送而收不到该拒绝响应；响应结束后关闭当前连接，请求体
+            # 不会被当作后续请求继续解释
+            self._discard_body()
+            self.close_connection = True
+            body = METHOD_NOT_SUPPORTED_BODY
+            self.send_response(501)
+            self.send_header("Content-Type", CONTENT_TYPE)
+            # HEAD 不发送正文，但 Content-Length 仍表示该 JSON 原本的字节数
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def __getattr__(self, name):
+            # BaseHTTPRequestHandler 按 do_<METHOD> 分发；GET/POST 已显式
+            # 定义，其余任意方法（PUT、DELETE、OPTIONS、HEAD、PATCH 及自定义
+            # 方法等）统一走 501 拒绝，而不是标准库默认的 HTML 错误页
+            if name.startswith("do_"):
+                return self._reject_method
+            raise AttributeError(name)
 
         do_GET = _respond
         do_POST = _respond
