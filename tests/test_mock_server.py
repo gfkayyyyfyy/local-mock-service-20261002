@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from http.client import HTTPConnection
@@ -57,12 +58,61 @@ def write_rules(directory, name, routes):
     return path
 
 
-class ServerProcess:
-    """以现有命令行入口启动的 mock_server 子进程。"""
+class _OutputCollector:
+    """后台守护线程按字节块持续收集子进程管道输出。
 
-    def __init__(self, rules_path, port):
-        self.proc = subprocess.Popen(
-            [
+    Windows 的 selectors 无法等待普通管道，因此改用线程 + os.read：
+    两个平台行为一致，且只输出不带换行的片段也能被及时收集，
+    不会让启动等待阻塞在读操作上。
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._chunks = []
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self):
+        try:
+            while True:
+                # os.read 在 Windows 与 Linux 的管道上均可用，
+                # 有数据即返回（不要求凑满或出现换行）
+                chunk = os.read(self._stream.fileno(), 4096)
+                if not chunk:
+                    return
+                with self._lock:
+                    self._chunks.append(chunk)
+        except OSError:
+            # 管道已关闭（如进程被终止）：视为输出结束
+            return
+
+    def collected_bytes(self):
+        with self._lock:
+            return b"".join(self._chunks)
+
+    def collected_text(self):
+        return self.collected_bytes().decode("utf-8", "replace")
+
+    def finish(self, timeout=5.0):
+        """进程结束后收干残余输出并关闭管道，避免资源泄漏。"""
+        self._thread.join(timeout)
+        try:
+            self._stream.close()
+        except OSError:
+            pass
+
+
+class ServerProcess:
+    """以现有命令行入口启动的 mock_server 子进程。
+
+    启动等待只依赖轮询与后台读取线程，Windows 与 Linux 行为一致。
+    """
+
+    def __init__(self, rules_path, port, startup_timeout=STARTUP_TIMEOUT,
+                 command=None):
+        if command is None:
+            command = [
                 sys.executable,
                 "-m",
                 "mock_server",
@@ -70,40 +120,50 @@ class ServerProcess:
                 str(rules_path),
                 "--port",
                 str(port),
-            ],
+            ]
+        self.proc = subprocess.Popen(
+            command,
             cwd=str(PROJECT_ROOT),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
         )
         self.port = port
-        self._wait_until_listening()
-
-    def _wait_until_listening(self):
-        deadline = time.monotonic() + STARTUP_TIMEOUT
-        selector = DefaultSelector()
-        selector.register(self.proc.stdout, EVENT_READ)
+        self._stdout = _OutputCollector(self.proc.stdout)
+        self._stderr = _OutputCollector(self.proc.stderr)
         try:
-            while time.monotonic() < deadline:
-                if self.proc.poll() is not None:
-                    out, err = self.proc.communicate(timeout=5)
-                    raise AssertionError(
-                        f"mock_server 提前退出（退出码 {self.proc.returncode}）；"
-                        f"stdout={out!r} stderr={err!r}"
-                    )
-                for key, _ in selector.select(timeout=0.2):
-                    line = key.fileobj.readline()
-                    if not line:
-                        continue
-                    if STARTUP_MARKER in line:
-                        return
+            self.wait_until_listening(startup_timeout)
+        except BaseException:
+            # 报错前回收子进程并关闭管道，监听端口随之释放
             self.stop()
-            raise AssertionError(
-                f"mock_server 在 {STARTUP_TIMEOUT}s 内未输出监听提示"
-            )
-        finally:
-            selector.close()
+            raise
+
+    def wait_until_listening(self, timeout):
+        """等到标准输出出现监听提示；提前退出或超时均抛 AssertionError。"""
+        deadline = time.monotonic() + timeout
+        marker = STARTUP_MARKER.encode("ascii")
+        while True:
+            # 提示前的普通输出行（含未换行片段）不影响继续等待
+            if marker in self._stdout.collected_bytes():
+                return
+            returncode = self.proc.poll()
+            if returncode is not None:
+                # 进程已退出：先收干残余输出，再在消息中给出完整上下文
+                self._stdout.finish()
+                self._stderr.finish()
+                raise AssertionError(
+                    f"mock_server 提前退出（退出码 {returncode}）；"
+                    f"stdout={self._stdout.collected_text()!r} "
+                    f"stderr={self._stderr.collected_text()!r}"
+                )
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"mock_server 启动等待超时：{timeout:.1f}s 内未输出 "
+                    f"{STARTUP_MARKER!r}；已收集 "
+                    f"stdout={self._stdout.collected_text()!r} "
+                    f"stderr={self._stderr.collected_text()!r}"
+                )
+            time.sleep(0.02)
 
     def stop(self):
         if self.proc.poll() is None:
@@ -113,12 +173,9 @@ class ServerProcess:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
-        # 关闭管道并取走残余输出，避免资源泄漏
-        try:
-            self.proc.communicate(timeout=5)
-        except (subprocess.TimeoutExpired, ValueError):
-            self.proc.kill()
-            self.proc.communicate(timeout=5)
+        # 进程结束后管道到达 EOF，读取线程随之退出；关闭管道避免泄漏
+        self._stdout.finish()
+        self._stderr.finish()
 
 
 def request(port, method, target, body=None):
@@ -133,6 +190,204 @@ def request(port, method, target, body=None):
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# 启动等待流程回归
+#
+# ServerProcess 的就绪等待不依赖平台相关的管道 select（Windows 不支持），
+# 下列用例在 Windows 与 Linux 上都实际执行：成功就绪、提前退出、静默超时
+# 与未换行片段超时，以及失败/停止后的资源回收（端口可重新绑定）。
+# 超时用例使用较短的等待期限以保持测试快速；默认期限仍为 STARTUP_TIMEOUT。
+# ---------------------------------------------------------------------------
+
+# 超时用例的等待期限：远短于默认 10s，足以验证失败路径与资源回收
+STARTUP_TEST_TIMEOUT = 0.5
+
+# 静默但占用端口的子进程：绑定 127.0.0.1 后既不输出也不退出
+SILENT_LISTENER_CODE = (
+    "import socket, time\n"
+    "s = socket.socket()\n"
+    "s.bind(('127.0.0.1', {port}))\n"
+    "s.listen(1)\n"
+    "time.sleep(60)\n"
+)
+
+# 只输出不带换行的片段（监听提示的前缀，但不构成完整提示）后保持存活
+PARTIAL_OUTPUT_CODE = (
+    "import sys, time\n"
+    "sys.stdout.write('mock_server listen')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(60)\n"
+)
+
+# 先输出普通行，再输出完整监听提示
+NOISE_THEN_MARKER_CODE = (
+    "import time\n"
+    "print('noise line one')\n"
+    "print('noise line two')\n"
+    "time.sleep(0.2)\n"
+    "print('mock_server listening on http://127.0.0.1:1 (0 route(s))')\n"
+    "time.sleep(60)\n"
+)
+
+
+class StartupWaitTests(unittest.TestCase):
+    """启动等待：成功、提前退出与超时路径在 Windows/Linux 上一致。"""
+
+    def test_default_startup_timeout_remains_ten_seconds(self):
+        # 默认等待期限保持 10 秒
+        self.assertEqual(STARTUP_TIMEOUT, 10.0)
+
+    def test_ready_server_answers_hello_with_query_string(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_startup_hello.json",
+                [{"method": "GET", "path": "/hello",
+                  "body": {"message": "你好"}}],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/hello?x=1")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                expected_raw = '{"message":"你好"}'.encode("utf-8")
+                self.assertEqual(raw, expected_raw)
+                # Content-Length 为实际响应体字节数（中文按 UTF-8 计）
+                self.assertEqual(
+                    int(headers["Content-Length"]), len(expected_raw)
+                )
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"message": "你好"}
+                )
+            finally:
+                server.stop()
+
+    def test_early_exit_reports_returncode_and_collected_output(self):
+        # 重复路由：子进程在监听提示前以退出码 2 结束
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_startup_dup.json",
+                [
+                    {"method": "GET", "path": "/same", "body": 1},
+                    {"method": "GET", "path": "/same", "body": 2},
+                ],
+            )
+            port = free_port()
+            with self.assertRaises(AssertionError) as ctx:
+                ServerProcess(rules_path, port)
+            message = str(ctx.exception)
+            self.assertIn("退出码 2", message)
+            self.assertIn("duplicate route", message)
+            self.assertIn("stdout=", message)
+            self.assertIn("stderr=", message)
+
+            # 失败路径已回收子进程：同一端口可立即重新启动合法服务
+            good_path = write_rules(
+                tmp,
+                "rules_startup_good.json",
+                [{"method": "GET", "path": "/hello",
+                  "body": {"message": "你好"}}],
+            )
+            server = ServerProcess(good_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/hello?x=1")
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"message": "你好"}
+                )
+            finally:
+                server.stop()
+
+    def test_early_exit_with_empty_output_still_identifies_both_streams(self):
+        # 无任何输出即退出：消息中 stdout/stderr 两项仍可辨认为空
+        command = [sys.executable, "-c", "raise SystemExit(2)"]
+        with self.assertRaises(AssertionError) as ctx:
+            ServerProcess(None, free_port(), command=command)
+        message = str(ctx.exception)
+        self.assertIn("退出码 2", message)
+        self.assertIn("stdout=''", message)
+        self.assertIn("stderr=''", message)
+
+    def test_startup_timeout_with_silent_process(self):
+        # 子进程绑定端口后完全静默：期限届满抛 AssertionError 并回收进程
+        port = free_port()
+        command = [
+            sys.executable, "-c", SILENT_LISTENER_CODE.format(port=port)
+        ]
+        with self.assertRaises(AssertionError) as ctx:
+            ServerProcess(
+                None, port,
+                startup_timeout=STARTUP_TEST_TIMEOUT, command=command,
+            )
+        message = str(ctx.exception)
+        self.assertIn("超时", message)
+        self.assertIn(f"{STARTUP_TEST_TIMEOUT:.1f}s", message)
+        self.assertIn("stdout=''", message)
+        self.assertIn("stderr=''", message)
+
+        # 静默子进程已被回收：它占用的端口可重新绑定并正常服务
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_startup_reuse.json",
+                [{"method": "GET", "path": "/hello",
+                  "body": {"message": "你好"}}],
+            )
+            server = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/hello?x=1")
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"message": "你好"}
+                )
+            finally:
+                server.stop()
+
+    def test_startup_timeout_with_partial_output_without_newline(self):
+        # 仅输出不带换行的片段：读取不阻塞，超时消息保留已收集片段
+        port = free_port()
+        command = [sys.executable, "-u", "-c", PARTIAL_OUTPUT_CODE]
+        with self.assertRaises(AssertionError) as ctx:
+            ServerProcess(
+                None, port,
+                startup_timeout=STARTUP_TEST_TIMEOUT, command=command,
+            )
+        message = str(ctx.exception)
+        self.assertIn("超时", message)
+        self.assertIn(f"{STARTUP_TEST_TIMEOUT:.1f}s", message)
+        self.assertIn("mock_server listen", message)
+
+    def test_noise_lines_before_marker_do_not_break_waiting(self):
+        # 提示前的普通输出行不影响继续等待，出现提示即视为就绪
+        command = [sys.executable, "-u", "-c", NOISE_THEN_MARKER_CODE]
+        server = ServerProcess(None, free_port(), command=command)
+        server.stop()
+
+    def test_port_reusable_after_normal_stop(self):
+        # 正常停止后回收进程与管道：同一端口可重新启动并服务
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_startup_stop.json",
+                [{"method": "GET", "path": "/hello",
+                  "body": {"message": "你好"}}],
+            )
+            port = free_port()
+            first = ServerProcess(rules_path, port)
+            first.stop()
+
+            second = ServerProcess(rules_path, port)
+            try:
+                status, headers, raw = request(port, "GET", "/hello?x=1")
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"message": "你好"}
+                )
+            finally:
+                second.stop()
 
 class MockServerRegressionTests(unittest.TestCase):
     @classmethod
