@@ -1,4 +1,4 @@
-"""入口：python -m mock_server --rules rules.json --port 8765"""
+"""入口：python -m mock_server --rules rules.json [--port 8765] [--check-rules]"""
 
 import sys
 
