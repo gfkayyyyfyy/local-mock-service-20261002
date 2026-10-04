@@ -5552,6 +5552,402 @@ class BodyModeTemplateTests(unittest.TestCase):
             self.assertNotIn(("GET", "/old"), routes.template_bodies)
 
 
+SPEC_SUFFIX_ROUTES = [
+    {"method": "GET", "path": "/files/", "pathMode": "prefix",
+     "bodyMode": "template",
+     "body": {"suffix": "{{request.pathSuffix}}"}},
+    {"method": "GET", "path": "/files/images/", "pathMode": "prefix",
+     "bodyMode": "template",
+     "body": {"suffix": "{{request.pathSuffix}}"}},
+    {"method": "GET", "path": "/files/ping", "bodyMode": "template",
+     "body": {"suffix": "{{request.pathSuffix}}"}},
+]
+
+
+class PathSuffixTemplateTests(unittest.TestCase):
+    """{{request.pathSuffix}}：prefix 命中回显选中前缀之后的剩余文本，
+    exact 命中固定为空字符串；其余模板规则与既有占位符一致。"""
+
+    def _start(self, tmp, name, routes):
+        rules_path = write_rules(tmp, name, routes)
+        port = free_port()
+        server = ServerProcess(rules_path, port)
+        self.addCleanup(server.stop)
+        return port
+
+    def test_spec_acceptance(self):
+        # 规格样例：GET /files/images/A%2Fb/detail/?x=1 -> 200
+        # {"suffix":"A%2Fb/detail/"}；GET /files/ping?x=1 -> 200
+        # {"suffix":""}
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_spec.json", SPEC_SUFFIX_ROUTES)
+            status, headers, raw = request(
+                port, "GET", "/files/images/A%2Fb/detail/?x=1"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"suffix": "A%2Fb/detail/"},
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+            status, headers, raw = request(port, "GET", "/files/ping?x=1")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")), {"suffix": ""}
+            )
+            self.assertEqual(raw, b'{"suffix":""}')
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_rule_order_does_not_change_suffix(self):
+        # 调换规则顺序：最长前缀选择与 suffix 文本均不变
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(
+                tmp,
+                "rules_suffix_reversed.json",
+                list(reversed(SPEC_SUFFIX_ROUTES)),
+            )
+            for target, expected in (
+                ("/files/images/A%2Fb/detail/?x=1", "A%2Fb/detail/"),
+                ("/files/images/x", "x"),
+                ("/files/other/x", "other/x"),
+                ("/files/ping?x=1", ""),
+            ):
+                with self.subTest(target=target):
+                    status, headers, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"suffix": expected},
+                    )
+                    self.assertEqual(
+                        int(headers["Content-Length"]), len(raw)
+                    )
+
+    def test_consecutive_requests_echo_their_own_suffixes(self):
+        # 连续请求不同路径只回显各自的剩余文本，互不沿用（同一连接）
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(
+                tmp, "rules_suffix_sequence.json", SPEC_SUFFIX_ROUTES
+            )
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                sequence = [
+                    ("/files/images/A%2Fb/detail/?x=1", "A%2Fb/detail/"),
+                    ("/files/plain", "plain"),
+                    ("/files/ping?y=2", ""),
+                    ("/files/images//Tail/", "/Tail/"),
+                    ("/files/images/A%2Fb/detail/?x=1", "A%2Fb/detail/"),
+                ]
+                for target, expected in sequence:
+                    with self.subTest(target=target):
+                        conn.request("GET", target)
+                        resp = conn.getresponse()
+                        raw = resp.read()
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(
+                            json.loads(raw.decode("utf-8")),
+                            {"suffix": expected},
+                        )
+                        self.assertEqual(
+                            int(resp.getheader("Content-Length")), len(raw)
+                        )
+            finally:
+                conn.close()
+
+    def test_remainder_kept_verbatim_without_decode_or_normalization(self):
+        # 剩余文本保留大小写、多级路径、连续斜杠、尾斜杠与百分号转义，
+        # 不解码、不规范化；查询串与片段不计入。原始 UTF-8 段按 UTF-8
+        # 回显，Content-Length 按最终字节数计算
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_verbatim.json", [
+                {"method": "GET", "path": "/files/", "pathMode": "prefix",
+                 "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+            ])
+            cases = [
+                ("/files/A%2Fb/detail/?x=1", "A%2Fb/detail/"),
+                ("/files/Mixed//Double///", "Mixed//Double///"),
+                ("/files/a/b/c", "a/b/c"),
+                ("/files/%ZZ%zz%2f", "%ZZ%zz%2f"),
+                ("/files/UPPER", "UPPER"),
+                ("/files/a#frag-ment", "a"),
+                ("/files/a?x=1#frag", "a"),
+                ("/files/%E4%BD%A0", "%E4%BD%A0"),
+            ]
+            for target, expected in cases:
+                with self.subTest(target=target):
+                    status, headers, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    expected_raw = json.dumps(
+                        {"suffix": expected},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    self.assertEqual(raw, expected_raw)
+                    self.assertEqual(
+                        int(headers["Content-Length"]), len(expected_raw)
+                    )
+
+    def test_exact_hit_always_has_empty_suffix(self):
+        # 精确路由（根路径、普通路径、尾斜杠路径）命中时 suffix 固定为空，
+        # 与同路径是否存在 prefix 配置无关
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_exact.json", [
+                {"method": "GET", "path": "/e", "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+                {"method": "GET", "path": "/e/", "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+                {"method": "GET", "path": "/", "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+            ])
+            for target in ("/e", "/e?x=1", "/e/", "/"):
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(raw, b'{"suffix":""}')
+
+    def test_root_prefix_strips_only_one_leading_slash(self):
+        # 根前缀 / 只去掉开头的一个斜杠：suffix 是路径中紧跟首斜杠之后的
+        # 全部文本，内部的连续斜杠与尾斜杠原样保留。注：标准库 HTTP
+        # 处理器会把以多个斜杠开头的请求目标（// 形式，客户端视作网络
+        # 路径）收敛为单斜杠，因此经 HTTP 到达根前缀的 suffix 不会以
+        # 斜杠开头，这是与 {{request.path}} 一致的既有传输层行为
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_root.json", [
+                {"method": "GET", "path": "/", "pathMode": "prefix",
+                 "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+            ])
+            cases = [
+                ("/a", "a"),
+                ("/a//b", "a//b"),
+                ("/a///b/", "a///b/"),
+                ("/a/b/", "a/b/"),
+                ("/files/x?z=9", "files/x"),
+            ]
+            for target, expected in cases:
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"suffix": expected},
+                    )
+            # 路径与前缀相等（剩余为空）仍不命中根前缀规则
+            status, _, raw = request(port, "GET", "/")
+            self.assertEqual(status, 404)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"error": "route_not_found"},
+            )
+
+    def test_empty_remainder_does_not_match_prefix(self):
+        # 请求路径与某个前缀相等时不命中该前缀规则（即使模板引用 suffix）。
+        # 只剩自身这一条前缀时返回 404；若还存在更短前缀，则按更短前缀的
+        # 非空剩余文本命中（/files/images/ -> /files/ -> "images/"）
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port_a = self._start(tmp, "rules_suffix_empty_a.json", [
+                {"method": "GET", "path": "/files/images/",
+                 "pathMode": "prefix", "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+            ])
+            status, _, raw = request(port_a, "GET", "/files/images/")
+            self.assertEqual(status, 404)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"error": "route_not_found"},
+            )
+
+            port_b = self._start(tmp, "rules_suffix_empty_b.json", [
+                {"method": "GET", "path": "/files/", "pathMode": "prefix",
+                 "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+            ])
+            status, _, raw = request(port_b, "GET", "/files/")
+            self.assertEqual(status, 404)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"error": "route_not_found"},
+            )
+
+            # 完整规则集：/files/images/ 与最长前缀相等，但仍是更短前缀
+            # /files/ 的非空剩余部分，故按更短前缀命中
+            port_c = self._start(
+                tmp, "rules_suffix_empty_c.json", SPEC_SUFFIX_ROUTES
+            )
+            status, _, raw = request(port_c, "GET", "/files/images/")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")), {"suffix": "images/"}
+            )
+
+    def test_longest_prefix_owns_the_suffix(self):
+        # 多个前缀候选时选最长者：suffix 只去掉最长前缀
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(
+                tmp, "rules_suffix_longest.json", SPEC_SUFFIX_ROUTES
+            )
+            for target, expected in (
+                ("/files/images/a/b", "a/b"),
+                ("/files/imagesx", "imagesx"),
+                ("/files/x", "x"),
+            ):
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"suffix": expected},
+                    )
+
+    def test_nested_repeated_mixed_values_replaced(self):
+        # 沿用既有模板规则：顶层与嵌套对象、数组中的字符串值均可替换，
+        # 支持嵌入、重复及与已有占位符混用；对象键、非字符串值与 JSON
+        # 结构不变；带空格或大小写不同的写法原样保留
+        body = {
+            "{{request.pathSuffix}}": "键名保持原样",
+            "s": "{{request.pathSuffix}}",
+            "repeat": "<{{request.pathSuffix}}><{{request.pathSuffix}}>",
+            "embed": "x{{request.pathSuffix}}y",
+            "mix": "{{request.path}}|[{{request.pathSuffix}}]|"
+                   "{{request.method}}|{{request.query}}",
+            "nested": {"list": ["{{request.pathSuffix}}", 1, 1.5, True,
+                                None, ["x{{request.pathSuffix}}y"]]},
+            "spaced": "{{ request.pathSuffix }}",
+            "case": "{{Request.PathSuffix}}",
+            "other": "{{request.suffix}}",
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_nested.json", [
+                {"method": "GET", "path": "/p/", "pathMode": "prefix",
+                 "bodyMode": "template", "body": body},
+                {"method": "GET", "path": "/e", "bodyMode": "template",
+                 "body": body},
+            ])
+            status, headers, raw = request(port, "GET", "/p/a/b?z=9")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {
+                    "{{request.pathSuffix}}": "键名保持原样",
+                    "s": "a/b",
+                    "repeat": "<a/b><a/b>",
+                    "embed": "xa/by",
+                    "mix": "/p/a/b|[a/b]|GET|z=9",
+                    "nested": {"list": ["a/b", 1, 1.5, True, None,
+                                        ["xa/by"]]},
+                    "spaced": "{{ request.pathSuffix }}",
+                    "case": "{{Request.PathSuffix}}",
+                    "other": "{{request.suffix}}",
+                },
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+            # exact 命中：suffix 固定为空，其余占位符照常渲染
+            status, _, raw = request(port, "GET", "/e")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {
+                    "{{request.pathSuffix}}": "键名保持原样",
+                    "s": "",
+                    "repeat": "<><>",
+                    "embed": "xy",
+                    "mix": "/e|[]|GET|",
+                    "nested": {"list": ["", 1, 1.5, True, None, ["xy"]]},
+                    "spaced": "{{ request.pathSuffix }}",
+                    "case": "{{Request.PathSuffix}}",
+                    "other": "{{request.suffix}}",
+                },
+            )
+
+    def test_suffix_replacement_text_is_not_reprocessed(self):
+        # 替换产生的文本不再次展开：剩余路径中的占位符形态与百分号转义
+        # 都按普通字面量保留
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_reprocess.json", [
+                {"method": "GET", "path": "/p/", "pathMode": "prefix",
+                 "bodyMode": "template",
+                 "body": {"t": "{{request.pathSuffix}}"}},
+            ])
+            status, _, raw = request(
+                port, "GET", "/p/x/{{request.pathSuffix}}"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"t": "x/{{request.pathSuffix}}"},
+            )
+            status, _, raw = request(
+                port, "GET",
+                "/p/" + "%7B%7Brequest.pathSuffix%7D%7D",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"t": "%7B%7Brequest.pathSuffix%7D%7D"},
+            )
+
+    def test_fixed_and_default_mode_keep_suffix_placeholder_verbatim(self):
+        # fixed 及省略 bodyMode 时 {{request.pathSuffix}} 原样返回
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_fixed.json", [
+                {"method": "GET", "path": "/default/", "pathMode": "prefix",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+                {"method": "GET", "path": "/fixed/", "pathMode": "prefix",
+                 "bodyMode": "fixed",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+            ])
+            for target in ("/default/a", "/fixed/a"):
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"suffix": "{{request.pathSuffix}}"},
+                    )
+
+    def test_suffix_echo_works_for_post(self):
+        # GET 与 POST 均可使用：POST 前缀模板路由同样回显剩余文本
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_suffix_post.json", [
+                {"method": "POST", "path": "/files/", "pathMode": "prefix",
+                 "bodyMode": "template",
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+                {"method": "POST", "path": "/submit",
+                 "bodyMode": "template", "requestBody": {"ok": True},
+                 "body": {"suffix": "{{request.pathSuffix}}"}},
+                {"method": "POST", "path": "/files/alt/",
+                 "pathMode": "prefix", "body": {"v": "fallback"}},
+            ])
+            status, headers, raw = request(
+                port, "POST", "/files/upload?a=1", body=b'{"anything":1}'
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")), {"suffix": "upload"}
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+            # exact POST 命中 suffix 为空
+            status, _, raw = request(
+                port, "POST", "/submit?z=1", body=b'{"ok":true}'
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, b'{"suffix":""}')
+            # 正文样例校验失败：400 request_body_mismatch，不采用配置响应
+            # 或延迟，不尝试其他路由，模板不渲染
+            status, _, raw = request(
+                port, "POST", "/submit?z=1", body=b'{"ok":false}'
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"error": "request_body_mismatch"},
+            )
+
+
 INVALID_BODY_MODES = [
     ('大小写不同 "Fixed"', "Fixed"),
     ('大小写不同 "TEMPLATE"', "TEMPLATE"),
