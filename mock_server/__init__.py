@@ -16,6 +16,9 @@ CONTENT_TYPE = "application/json; charset=utf-8"
 # requestBodyMode 的合法取值：省略或 "exact" 为原有的整体相等比较，
 # "subset" 启用对象子集匹配；取值区分大小写
 REQUEST_BODY_MODES = ("exact", "subset")
+# pathMode 的合法取值：省略或 "exact" 为原有的完整路径相等匹配，
+# "prefix" 将 path 作为前缀匹配；取值区分大小写
+PATH_MODES = ("exact", "prefix")
 
 
 class RulesError(Exception):
@@ -58,7 +61,9 @@ class Routes(dict):
     request_bodies 为 {(method, path): 样例值}，仅含显式配置 requestBody
     的 POST 路由，键不存在表示该路由忽略请求正文；
     request_body_modes 为 {(method, path): "exact"|"subset"}，键集合与
-    request_bodies 一致，缺省 requestBodyMode 时记为 "exact"。
+    request_bodies 一致，缺省 requestBodyMode 时记为 "exact"；
+    path_modes 为 {(method, path): "prefix"}，仅含显式配置
+    pathMode="prefix" 的路由，键不存在表示该路由按完整路径相等匹配。
     """
 
 
@@ -171,7 +176,9 @@ def load_rules(path):
     仅包含显式配置 requestBody 的 POST 路由（样例可以是 None，对应显式
     JSON null，故以键是否存在而非值是否为 None 区分）；
     request_body_modes 属性为 {(method, path): "exact"|"subset"} 映射，
-    键集合与 request_bodies 一致。
+    键集合与 request_bodies 一致；path_modes 属性为
+    {(method, path): "prefix"} 映射，仅包含显式配置 pathMode="prefix"
+    的路由（省略或 "exact" 的路由不出现，按键是否存在区分匹配模式）。
     """
     try:
         with open(path, "rb") as f:
@@ -201,6 +208,7 @@ def load_rules(path):
     routes.delays = {}
     routes.request_bodies = {}
     routes.request_body_modes = {}
+    routes.path_modes = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -224,8 +232,23 @@ def load_rules(path):
                 f"{where}: path must be a string starting with '/' "
                 f"and contain no '?' or '#', got {route_path!r}"
             )
+        path_mode = item.get("pathMode", "exact")
+        if path_mode not in PATH_MODES:
+            # 其他字符串或非字符串值（null、数字、数组、对象、布尔）一律拒绝
+            raise RulesError(
+                f"{where}.pathMode must be 'exact' or 'prefix', "
+                f"got {path_mode!r}"
+            )
+        if path_mode == "prefix" and not route_path.endswith("/"):
+            # 前缀路径沿用原有 path 限制，另外要求以 / 结尾（根路径 /
+            # 本身即以 / 结尾，允许作为前缀）
+            raise RulesError(
+                f"{where}.path must end with '/' when pathMode is "
+                f"'prefix', got {route_path!r}"
+            )
         key = (method, route_path)
         if key in routes:
+            # 同一 method 和 path 不允许重复，不能靠不同的 pathMode 区分
             raise RulesError(f"{where}: duplicate route {method} {route_path}")
         request_body_sample = None
         if "requestBodyMode" in item:
@@ -287,6 +310,8 @@ def load_rules(path):
             )
         routes[key] = (status, body)
         routes.delays[key] = delay_ms
+        if path_mode == "prefix":
+            routes.path_modes[key] = "prefix"
         if "requestBody" in item:
             routes.request_bodies[key] = request_body_sample
             routes.request_body_modes[key] = item.get("requestBodyMode", "exact")
@@ -337,15 +362,36 @@ def _make_handler(routes):
                 return _json_subset(sample, data)
             return _json_equal(sample, data)
 
+        def _select_route(self, path):
+            # 先按请求方法筛选：完整路径相等的 exact 规则优先；没有时在
+            # 同方法的 prefix 规则中取 path 最长的候选——请求路径须以该
+            # 前缀开头且剩余部分非空（剩余部分可含多级路径）。规则排列
+            # 顺序不影响结果。两种模式都按原样比较：大小写、尾部斜杠与
+            # 百分号转义不规范化，星号没有特殊含义。
+            key = (self.command, path)
+            if key in routes and key not in routes.path_modes:
+                return key
+            best = None
+            for candidate in routes.path_modes:
+                method, prefix = candidate
+                if (
+                    method == self.command
+                    and path.startswith(prefix)
+                    and len(path) > len(prefix)
+                    and (best is None or len(prefix) > len(best[1]))
+                ):
+                    best = candidate
+            return best
+
         def _respond(self):
             raw_body = self._read_body()
             path = urlsplit(self.path).path
-            key = (self.command, path)
-            entry = routes.get(key)
-            if entry is None:
+            key = self._select_route(path)
+            if key is None:
                 # 未命中即使正文非法也返回原有 404 正文，不做请求体校验
                 self._send(404, NOT_FOUND_BODY)
                 return
+            entry = routes[key]
             if key in routes.request_bodies and not self._body_matches(
                 routes.request_bodies[key],
                 raw_body,
