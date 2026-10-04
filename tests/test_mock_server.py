@@ -6128,5 +6128,293 @@ class DelayedTemplateCheckedRouteTests(unittest.TestCase):
                 server.stop()
 
 
+# ---------------------------------------------------------------------------
+# --check-rules 规则检查入口回归
+#
+# 下列用例只针对规则检查入口：用临时规则文件经
+# `python -m mock_server --check-rules` 的真实命令行启动子进程，核对
+# 退出码与标准输出/标准错误两条流（不调用内部函数代替公开行为）。检查
+# 进程校验完规则后自行退出，不启动服务、不绑定或探测端口，因此用例不
+# 发送请求、不等待监听提示，也不需要手动中断。
+# ---------------------------------------------------------------------------
+
+CHECK_RULES_TIMEOUT = 10.0
+# 成功检查只做与正常启动一致的规则加载：不展开模板、不按 delayMs 等待。
+# 样例中模板路由配置了 2000ms 延迟，检查若误执行等待，耗时必然远超该上界
+CHECK_RULES_NO_WAIT_MAX_SECONDS = 1.0
+
+# 规则检查成功样例：两条合法路由。GET /hello 固定中文正文；POST /echo
+# 为带 2000ms 延迟的模板路由（检查只校验配置，绝不渲染或等待）
+CHECK_RULES_VALID_ROUTES = [
+    {"method": "GET", "path": "/hello",
+     "body": {"message": "你好"}},
+    {"method": "POST", "path": "/echo",
+     "bodyMode": "template",
+     "body": "{{request.path}}",
+     "delayMs": 2000},
+]
+CHECK_RULES_VALID_LINE = f"mock_server rules valid (2 route(s))\n"
+CHECK_RULES_EMPTY_LINE = "mock_server rules valid (0 route(s))\n"
+
+
+def run_check_rules(rules_path, port=None, timeout=CHECK_RULES_TIMEOUT):
+    """经公开命令行入口执行 `python -m mock_server --check-rules`。
+
+    等待检查进程【自行退出】，返回 (returncode, stdout, stderr, elapsed)。
+    进程在 timeout 秒内未结束即判失败：杀掉并回收进程与管道后抛
+    AssertionError，绝不靠等待用户中断完成测试。即使调用方随后断言失败，
+    进程也已退出、管道已关闭，无资源残留。
+    """
+    command = [
+        sys.executable, "-m", "mock_server",
+        "--rules", str(rules_path),
+        "--check-rules",
+    ]
+    if port is not None:
+        command.extend(["--port", str(port)])
+    proc = subprocess.Popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    start = time.monotonic()
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 超时判失败并回收进程，不通过等待用户中断完成测试
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise AssertionError(
+                f"mock_server --check-rules 在 {timeout}s 内未自行退出"
+                f"（pid={proc.pid}）"
+            )
+        elapsed = time.monotonic() - start
+        return proc.returncode, stdout, stderr, elapsed
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+class occupied_local_port:
+    """上下文期间占用一个 127.0.0.1 端口并保持可接受连接的本地监听器。
+
+    退出上下文即关闭监听套接字；断言异常时同样释放占用的端口。
+    """
+
+    def __enter__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.sock.close()
+        return False
+
+    def assert_still_usable(self, test_case):
+        """检查子进程结束后，原监听器仍可接受新连接。"""
+        probe_timeout = 2.0
+        self.sock.settimeout(probe_timeout)
+        client = socket.create_connection(
+            ("127.0.0.1", self.port), timeout=probe_timeout
+        )
+        try:
+            server_conn, _ = self.sock.accept()
+            server_conn.close()
+        finally:
+            client.close()
+        test_case.assertTrue(
+            True, "被占用端口上的原监听器在规则检查后仍可接受连接"
+        )
+
+
+class CheckRulesEntryTests(unittest.TestCase):
+    """--check-rules：校验配置后自行退出；不启动服务、不触碰端口。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_check_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.valid_path = write_rules(
+            cls._tmp.name, "rules_check_valid.json", CHECK_RULES_VALID_ROUTES
+        )
+        cls.empty_path = write_rules(
+            cls._tmp.name, "rules_check_empty.json", []
+        )
+        # JSON 语法错误：json.dumps 无法产出，直接写原始文本
+        cls.syntax_error_path = write_rules_text(
+            cls._tmp.name,
+            "rules_check_syntax_error.json",
+            '{"routes": [\n'
+            '  {"method": "GET", "path": "/oops", "body": }\n'
+            ']}\n',
+        )
+        # bodyMode 取值区分大小写："Template" 非法（合法值为 "template"）
+        cls.bad_body_mode_path = write_rules(
+            cls._tmp.name,
+            "rules_check_bad_body_mode.json",
+            [{"method": "GET", "path": "/x",
+              "bodyMode": "Template", "body": "ignored"}],
+        )
+        # 溢出数字 1e400 位于会被忽略的额外字段中，仍须拒绝整份规则
+        cls.overflow_path = write_rules_text(
+            cls._tmp.name,
+            "rules_check_overflow_extra.json",
+            '{"routes":[],"ignored":{"huge":1e400}}\n',
+        )
+
+    def assert_check_success(self, returncode, stdout, stderr, expected_line,
+                            elapsed=None):
+        self.assertEqual(
+            returncode, 0,
+            f"规则检查应成功（退出码 0），实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        # 标准输出只有这一行（含换行），标准错误为空
+        self.assertEqual(
+            stdout, expected_line,
+            f"标准输出应只有 {expected_line!r} 一行，实际 {stdout!r}",
+        )
+        self.assertEqual(
+            stderr, "", f"成功时标准错误应为空，实际 {stderr!r}"
+        )
+        # 检查进程不输出监听或停止提示（精确等值已保证，这里显式声明意图）
+        self.assertNotIn(STARTUP_MARKER, stdout + stderr)
+        self.assertNotIn("mock_server stopped", stdout + stderr)
+        if elapsed is not None:
+            self.assertLess(
+                elapsed, CHECK_RULES_NO_WAIT_MAX_SECONDS,
+                f"规则检查不应按 delayMs 等待或渲染模板，实际耗时 "
+                f"{elapsed * 1000:.1f}ms",
+            )
+
+    def assert_check_rules_error(self, returncode, stdout, stderr, fragment):
+        """规则加载错误：退出码 2、stdout 为空、stderr 以 error: 给原因。"""
+        self.assertEqual(
+            returncode, 2,
+            f"规则检查失败应返回退出码 2，实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        self.assertEqual(
+            stdout, "", f"失败时标准输出应为空，实际 {stdout!r}"
+        )
+        self.assertTrue(
+            stderr.startswith("error: "),
+            f"规则加载错误应以 'error: ' 开头，实际 stderr={stderr!r}",
+        )
+        self.assertIn(
+            fragment, stderr,
+            f"标准错误应包含原因片段 {fragment!r}，实际 stderr={stderr!r}",
+        )
+        self.assertNotIn("Traceback", stderr)
+
+    def assert_check_argparse_error(self, returncode, stdout, stderr,
+                                    *fragments):
+        """参数错误：退出码 2、stdout 为空，stderr 保留 argparse 表达。"""
+        self.assertEqual(
+            returncode, 2,
+            f"参数错误应返回退出码 2，实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        self.assertEqual(
+            stdout, "", f"参数错误时标准输出应为空，实际 {stdout!r}"
+        )
+        # argparse 的标准形式 "prog: error: argument ..."，区别于规则加载
+        # 错误的 "error: ..."
+        self.assertIn(
+            "mock_server: error: argument --port:", stderr,
+            f"应保留 argparse 的参数错误表达，实际 stderr={stderr!r}",
+        )
+        for fragment in fragments:
+            self.assertIn(
+                fragment, stderr,
+                f"标准错误应包含 {fragment!r}，实际 stderr={stderr!r}",
+            )
+        self.assertNotIn("Traceback", stderr)
+
+    def test_valid_rules_without_port(self):
+        # 省略 --port：使用默认端口，但检查不绑定或探测它
+        returncode, stdout, stderr, elapsed = run_check_rules(self.valid_path)
+        self.assert_check_success(
+            returncode, stdout, stderr, CHECK_RULES_VALID_LINE, elapsed
+        )
+
+    def test_valid_rules_on_occupied_port(self):
+        # 传入一个被本地监听器占用的合法端口：检查仍应成功，且不触碰端口，
+        # 原监听器在检查结束后仍可使用
+        with occupied_local_port() as occupied:
+            returncode, stdout, stderr, elapsed = run_check_rules(
+                self.valid_path, port=occupied.port
+            )
+            self.assert_check_success(
+                returncode, stdout, stderr, CHECK_RULES_VALID_LINE, elapsed
+            )
+            occupied.assert_still_usable(self)
+
+    def test_empty_routes_reports_zero(self):
+        returncode, stdout, stderr, _ = run_check_rules(self.empty_path)
+        self.assert_check_success(
+            returncode, stdout, stderr, CHECK_RULES_EMPTY_LINE
+        )
+
+    def test_json_syntax_error_exits_2(self):
+        returncode, stdout, stderr, _ = run_check_rules(
+            self.syntax_error_path
+        )
+        self.assert_check_rules_error(
+            returncode, stdout, stderr, "is not valid JSON"
+        )
+
+    def test_invalid_body_mode_value_exits_2(self):
+        returncode, stdout, stderr, _ = run_check_rules(
+            self.bad_body_mode_path
+        )
+        self.assert_check_rules_error(
+            returncode, stdout, stderr,
+            "bodyMode must be 'fixed' or 'template', got 'Template'",
+        )
+
+    def test_overflow_number_in_ignored_extra_field_exits_2(self):
+        returncode, stdout, stderr, _ = run_check_rules(self.overflow_path)
+        self.assert_check_rules_error(
+            returncode, stdout, stderr, "non-finite number"
+        )
+
+    def test_port_non_integer_exits_2(self):
+        returncode, stdout, stderr, _ = run_check_rules(
+            self.valid_path, port="abc"
+        )
+        self.assert_check_argparse_error(
+            returncode, stdout, stderr,
+            "invalid port 'abc'", "must be an integer",
+        )
+
+    def test_port_zero_exits_2(self):
+        returncode, stdout, stderr, _ = run_check_rules(
+            self.valid_path, port=0
+        )
+        self.assert_check_argparse_error(
+            returncode, stdout, stderr,
+            "invalid port '0'", "must be between 1 and 65535",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
