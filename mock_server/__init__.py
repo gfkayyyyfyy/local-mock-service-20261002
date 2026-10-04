@@ -670,6 +670,14 @@ def main(argv=None):
         default=8765,
         help="port to listen on, 1-65535 (default: 8765)",
     )
+    parser.add_argument(
+        "--check-rules",
+        action="store_true",
+        help=(
+            "validate the rules file and exit without starting the server "
+            "(no port is bound or probed)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -677,6 +685,12 @@ def main(argv=None):
     except RulesError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    if args.check_rules:
+        # 仅做与正常启动完全一致的规则加载校验：不模拟请求、不渲染模板、
+        # 不按 delayMs 等待，也不绑定或探测端口；校验通过即结束
+        print(f"mock_server rules valid ({len(routes)} route(s))")
+        return 0
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), _make_handler(routes))
