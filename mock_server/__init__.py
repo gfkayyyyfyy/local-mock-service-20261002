@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,11 +22,18 @@ REQUEST_BODY_MODES = ("exact", "subset")
 PATH_MODES = ("exact", "prefix")
 # bodyMode 的合法取值：省略或 "fixed" 为原有的固定响应（body 含占位符
 # 也原样返回），"template" 将 body 字符串值中的 {{request.path}} 替换为
-# 本次用于匹配的路径；取值区分大小写
+# 本次用于匹配的路径、{{request.method}} 替换为本次请求方法的大写形式
+# （GET 或 POST）；取值区分大小写
 BODY_MODES = ("fixed", "template")
-# template 模式下唯一识别的占位符：带空格、大小写不同的写法及其他
+# template 模式下唯一识别的两个占位符：带空格、大小写不同的写法及其他
 # 占位符均保持原样
 PATH_PLACEHOLDER = "{{request.path}}"
+METHOD_PLACEHOLDER = "{{request.method}}"
+# 单次自左向右扫描同时处理两个占位符，保证嵌入、重复与混合出现的占位符
+# 都被替换，且替换结果（如路径文本中恰含占位符形态的字符）不再参与处理
+_TEMPLATE_PLACEHOLDER_RE = re.compile(
+    re.escape(PATH_PLACEHOLDER) + "|" + re.escape(METHOD_PLACEHOLDER)
+)
 
 
 class RulesError(Exception):
@@ -74,7 +82,7 @@ class Routes(dict):
     body_modes 为 {(method, path): "fixed"|"template"}，缺省 bodyMode 时
     记为 "fixed"，键集合与路由本身一致；
     template_bodies 为 {(method, path): body 原始 JSON 值}，仅含
-    bodyMode 为 "template" 的路由，供每次请求按当前路径渲染。
+    bodyMode 为 "template" 的路由，供每次请求按当前方法与路径渲染。
     """
 
 
@@ -179,23 +187,30 @@ def _json_subset(expected, actual):
     return _json_matches(expected, actual, allow_extra_keys=True)
 
 
-def _render_path_template(value, path):
+def _render_template(value, path, method):
     """template 模式的响应渲染：把字符串值中的 {{request.path}} 替换为
     本次用于匹配的路径（已去除查询串，大小写、尾斜杠与百分号转义按
-    原样保留，不额外解码或规范化）。
+    原样保留，不额外解码或规范化）、{{request.method}} 替换为本次请求
+    方法的大写形式（GET 或 POST，与查询参数和正文无关）。
 
     顶层及嵌套对象、数组中的字符串值均替换；对象键、非字符串值与
-    JSON 结构保持不变。str.replace 自左向右单次扫描，嵌入或重复的
-    占位符都被替换，且不会再次处理替换结果（路径文本中即使含有
-    占位符形态的字符也不会被二次替换）。不执行任何表达式。
+    JSON 结构保持不变。正则自左向右单次扫描，嵌入、重复或混合出现
+    的占位符都被替换，且不会再次处理替换结果（路径或方法文本中即使
+    含有占位符形态的字符也不会被二次替换）。带空格、大小写不同的
+    写法及其他占位符保持原样，不执行任何表达式。
     """
     if isinstance(value, str):
-        return value.replace(PATH_PLACEHOLDER, path)
+        return _TEMPLATE_PLACEHOLDER_RE.sub(
+            lambda match: path
+            if match.group(0) == PATH_PLACEHOLDER
+            else method,
+            value,
+        )
     if isinstance(value, list):
-        return [_render_path_template(item, path) for item in value]
+        return [_render_template(item, path, method) for item in value]
     if isinstance(value, dict):
         return {
-            key: _render_path_template(item, path)
+            key: _render_template(item, path, method)
             for key, item in value.items()
         }
     return value
@@ -215,7 +230,7 @@ def load_rules(path):
     body_modes 属性为 {(method, path): "fixed"|"template"} 映射，每条
     路由都有键，缺省 bodyMode 时记为 "fixed"；
     template_bodies 属性为 {(method, path): body 原始 JSON 值} 映射，
-    仅包含 bodyMode 为 "template" 的路由。
+    仅包含 bodyMode 为 "template" 的路由，供每次命中按当前方法与路径渲染。
     """
     try:
         with open(path, "rb") as f:
@@ -360,8 +375,8 @@ def load_rules(path):
         routes.path_modes[key] = path_mode
         routes.body_modes[key] = body_mode
         if body_mode == "template":
-            # 模板路由保留 body 的原始 JSON 值，每次命中按当前路径渲染；
-            # 上面的序列化已保证其中字符串值与对象键可编码为 UTF-8
+            # 模板路由保留 body 的原始 JSON 值，每次命中按当前方法与路径
+            # 渲染；上面的序列化已保证其中字符串值与对象键可编码为 UTF-8
             routes.template_bodies[key] = item["body"]
         if "requestBody" in item:
             routes.request_bodies[key] = request_body_sample
@@ -459,10 +474,11 @@ def _make_handler(routes):
             status, body = entry
             if routes.body_modes.get(key) == "template":
                 # 模板只作用于最终选中的路由：把 body 字符串值中的
-                # {{request.path}} 替换为本次用于匹配的路径后再序列化，
-                # Content-Length 按替换后的 UTF-8 JSON 字节数给出
-                rendered = _render_path_template(
-                    routes.template_bodies[key], path
+                # {{request.method}} 替换为本次请求方法（大写 GET 或
+                # POST）、{{request.path}} 替换为本次用于匹配的路径后
+                # 再序列化，Content-Length 按替换后的 UTF-8 JSON 字节数给出
+                rendered = _render_template(
+                    routes.template_bodies[key], path, self.command
                 )
                 body = json.dumps(
                     rendered, ensure_ascii=False, separators=(",", ":")
