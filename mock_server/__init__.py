@@ -19,6 +19,13 @@ REQUEST_BODY_MODES = ("exact", "subset")
 # pathMode 的合法取值：省略或 "exact" 为原有的完整路径相等匹配，
 # "prefix" 将规则 path 作为前缀；取值区分大小写
 PATH_MODES = ("exact", "prefix")
+# bodyMode 的合法取值：省略或 "fixed" 为原有的固定响应字节，
+# "template" 在每次请求时把字符串值中的 {{request.path}} 替换为
+# 本次用于匹配的路径；取值区分大小写
+BODY_MODES = ("fixed", "template")
+# template 模式唯一支持的占位符；仅区分大小写的精确写法被替换，
+# 其余写法（含空格、大小写不同）与其他占位符保持原样
+PATH_PLACEHOLDER = "{{request.path}}"
 
 
 class RulesError(Exception):
@@ -63,7 +70,11 @@ class Routes(dict):
     request_body_modes 为 {(method, path): "exact"|"subset"}，键集合与
     request_bodies 一致，缺省 requestBodyMode 时记为 "exact"；
     path_modes 为 {(method, path): "exact"|"prefix"}，缺省 pathMode 时
-    记为 "exact"，键集合与路由本身一致。
+    记为 "exact"，键集合与路由本身一致；
+    body_modes 为 {(method, path): "fixed"|"template"}，缺省 bodyMode 时
+    记为 "fixed"，键集合与路由本身一致。fixed 路由的 body 为预序列化的
+    固定响应字节，template 路由的 body 为解析后的 JSON 值，命中时按本次
+    匹配路径渲染后再序列化。
     """
 
 
@@ -89,6 +100,46 @@ def _ensure_finite_numbers(data):
         elif isinstance(value, list):
             for index in range(len(value) - 1, -1, -1):
                 stack.append((value[index], f"{location}[{index}]"))
+
+
+def _render_path_template(value, request_path):
+    """template 模式的响应体渲染：复制一份 JSON 值，仅把字符串值中的
+    {{request.path}} 替换为本次用于匹配的路径。
+
+    对象键保持原样；None、布尔、数字等非字符串值直接共享；对象与数组
+    结构不变，其中嵌套任意层级的字符串值都会被替换。同一字符串中的
+    多个、相邻或被其他文本包围的占位符均替换；带空格（{{ request.path }}）
+    或大小写不同（{{Request.Path}}）的写法以及其他占位符（{{x}}）保持
+    原样。str.replace 只扫描原始字符串，替换结果（即使其中含有占位符
+    文本）不会被再次处理，也不执行任何表达式。使用显式栈复制结构，
+    避免深层嵌套触发递归深度限制。
+    """
+    root_out = None
+    # (源值, 写入目标容器, 在目标容器中的键或下标)；根节点目标为 None
+    stack = [(value, None, None)]
+    while stack:
+        src, parent, pkey = stack.pop()
+        if isinstance(src, str):
+            out = src.replace(PATH_PLACEHOLDER, request_path)
+        elif isinstance(src, dict):
+            # 键集合、键本身与键顺序不变：只复制容器，值在后续迭代中
+            # 回填。栈为后进先出，按键的逆序压入以保证弹出（即写入）
+            # 顺序与原对象一致，序列化后的键序因此与 fixed 响应一致
+            out = {}
+            for k in reversed(list(src.keys())):
+                stack.append((src[k], out, k))
+        elif isinstance(src, list):
+            out = [None] * len(src)
+            for index in range(len(src) - 1, -1, -1):
+                stack.append((src[index], out, index))
+        else:
+            # json 解析结果中的 None/布尔/数字均为不可变标量，直接共享
+            out = src
+        if parent is None:
+            root_out = out
+        else:
+            parent[pkey] = out
+    return root_out
 
 
 def _json_matches(expected, actual, allow_extra_keys):
@@ -178,7 +229,11 @@ def load_rules(path):
     request_body_modes 属性为 {(method, path): "exact"|"subset"} 映射，
     键集合与 request_bodies 一致；
     path_modes 属性为 {(method, path): "exact"|"prefix"} 映射，每条路由
-    都有键，缺省 pathMode 时记为 "exact"。
+    都有键，缺省 pathMode 时记为 "exact"；
+    body_modes 属性为 {(method, path): "fixed"|"template"} 映射，每条路由
+    都有键，缺省 bodyMode 时记为 "fixed"。fixed 路由的 body 值预序列化为
+    紧凑 UTF-8 字节；template 路由的 body 保留解析后的 JSON 值（任意
+    JSON 值均可，包括 None），由处理程序在命中时按本次路径渲染。
     """
     try:
         with open(path, "rb") as f:
@@ -209,6 +264,7 @@ def load_rules(path):
     routes.request_bodies = {}
     routes.request_body_modes = {}
     routes.path_modes = {}
+    routes.body_modes = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -249,6 +305,14 @@ def load_rules(path):
             raise RulesError(
                 f"{where}.path for pathMode 'prefix' must end with '/', "
                 f"got {route_path!r}"
+            )
+        body_mode = item.get("bodyMode", "fixed")
+        if not isinstance(body_mode, str) or body_mode not in BODY_MODES:
+            # 其他字符串（含 "Fixed"、"TEMPLATE"）或非字符串值（null、布尔、
+            # 数字、数组、对象）一律拒绝；取值区分大小写
+            raise RulesError(
+                f"{where}.bodyMode must be 'fixed' or 'template', "
+                f"got {body_mode!r}"
             )
         request_body_sample = None
         if "requestBodyMode" in item:
@@ -297,9 +361,14 @@ def load_rules(path):
                 f"{where}: delayMs must be an integer between 0 and 2000 "
                 f"(inclusive), got {delay_ms!r}"
             )
+        body_value = item["body"]
         try:
-            body = json.dumps(
-                item["body"], ensure_ascii=False, separators=(",", ":")
+            # fixed 模式直接缓存序列化字节；template 模式保留解析值，
+            # 命中时按本次路径渲染。两种模式下 body 的字符串值与对象键
+            # 都不得含未配对代理码点（template 替换进来的请求路径来自
+            # ISO-8859-1 解码的请求行，必然可编码为 UTF-8）
+            body_encoded = json.dumps(
+                body_value, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8")
         except UnicodeEncodeError as exc:
             # body 中的字符串值或对象键含未配对的代理码点（如孤立 \ud800、
@@ -308,9 +377,16 @@ def load_rules(path):
             raise RulesError(
                 f"{where}.body cannot be encoded as UTF-8: {exc}"
             )
+        if body_mode == "fixed":
+            body = body_encoded
+        else:
+            # template：保留解析后的 JSON 值供每次请求复制渲染；
+            # 标量（None/bool/int/float/str）原样保留，对象/数组不被修改
+            body = body_value
         routes[key] = (status, body)
         routes.delays[key] = delay_ms
         routes.path_modes[key] = path_mode
+        routes.body_modes[key] = body_mode
         if "requestBody" in item:
             routes.request_bodies[key] = request_body_sample
             routes.request_body_modes[key] = item.get("requestBodyMode", "exact")
@@ -404,7 +480,19 @@ def _make_handler(routes):
             delay_ms = routes.delays.get(key, 0)
             if delay_ms:
                 time.sleep(delay_ms / 1000)
-            self._send(entry[0], entry[1])
+            if routes.body_modes.get(key, "fixed") == "template":
+                # 模板路由：把 body（加载时保留的 JSON 值）中各字符串值
+                # 内的 {{request.path}} 替换为本次匹配路径（已去除查询
+                # 串，大小写、尾斜杠与百分号转义保持原样）后再序列化。
+                # 校验失败的 400、未命中的 404 与不支持方法的 501 都走
+                # 不到这里，不参与渲染
+                rendered = _render_path_template(entry[1], path)
+                response_body = json.dumps(
+                    rendered, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            else:
+                response_body = entry[1]
+            self._send(entry[0], response_body)
 
         def _send(self, status, body):
             self.send_response(status)

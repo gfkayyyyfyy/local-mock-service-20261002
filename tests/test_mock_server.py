@@ -4973,5 +4973,494 @@ class PathModeBackwardCompatibilityTests(unittest.TestCase):
             server.stop()
 
 
+class RenderPathTemplateHelperTests(unittest.TestCase):
+    """直接锁定 _render_path_template 的替换语义（无需启动服务）。"""
+
+    def test_scalar_strings_replace_all_occurrences(self):
+        from mock_server import _render_path_template as render
+
+        self.assertEqual(render("{{request.path}}", "/echo/a"), "/echo/a")
+        # 嵌入文本、重复与相邻的占位符均替换
+        self.assertEqual(
+            render("a{{request.path}}b", "/echo/a"), "a/echo/ab"
+        )
+        self.assertEqual(
+            render("{{request.path}}{{request.path}}", "/x"), "/x/x"
+        )
+        self.assertEqual(
+            render("{{request.path}}|{{request.path}}", "/x"), "/x|/x"
+        )
+        # 无占位符的字符串原样返回
+        self.assertEqual(render("plain text", "/x"), "plain text")
+        # 非字符串标量原样返回（None 只等于 None）
+        self.assertIsNone(render(None, "/x"))
+        self.assertEqual(render(42, "/x"), 42)
+        self.assertEqual(render(3.5, "/x"), 3.5)
+        self.assertEqual(render(True, "/x"), True)
+        self.assertEqual(render(False, "/x"), False)
+
+    def test_other_placeholder_spellings_remain_literal(self):
+        from mock_server import _render_path_template as render
+
+        original = (
+            "{{ request.path }}|"
+            "{{Request.Path}}|"
+            "{{REQUEST.PATH}}|"
+            "{{x}}|"
+            "{{ request.path}}"
+        )
+        self.assertEqual(render(original, "/echo/a"), original)
+
+    def test_replacement_result_is_not_processed_again(self):
+        from mock_server import _render_path_template as render
+
+        # 替换进来的路径本身含占位符文本时，不会二次扫描替换结果
+        self.assertEqual(
+            render("{{request.path}}", "{{request.path}}"),
+            "{{request.path}}",
+        )
+        self.assertEqual(
+            render("a{{request.path}}b", "x{{request.path}}y"),
+            "ax{{request.path}}yb",
+        )
+
+    def test_nested_strings_replaced_but_keys_and_structure_unchanged(self):
+        from mock_server import _render_path_template as render
+
+        body = {
+            "p": "{{request.path}}",
+            "arr": ["x{{request.path}}y", 1, True, None,
+                    ["{{request.path}}"]],
+            "obj": {"inner": {"deep": ["{{request.path}}"]}},
+            "key {{request.path}}": "键不变，值 {{request.path}} 替换",
+            "num": 3.5,
+            "nil": None,
+            "empty_obj": {},
+            "empty_arr": [],
+        }
+        rendered = render(body, "/echo/a")
+        self.assertEqual(
+            rendered,
+            {
+                "p": "/echo/a",
+                "arr": ["x/echo/ay", 1, True, None, ["/echo/a"]],
+                "obj": {"inner": {"deep": ["/echo/a"]}},
+                "key {{request.path}}": "键不变，值 /echo/a 替换",
+                "num": 3.5,
+                "nil": None,
+                "empty_obj": {},
+                "empty_arr": [],
+            },
+        )
+        # 对象键集合与 JSON 结构保持不变
+        self.assertEqual(set(rendered), set(body))
+        self.assertEqual(len(rendered["arr"]), len(body["arr"]))
+
+    def test_original_value_is_not_mutated(self):
+        from copy import deepcopy
+        from mock_server import _render_path_template as render
+
+        body = {"p": "{{request.path}}",
+                "arr": [{"k": "{{request.path}}"}], "n": 1}
+        snapshot = deepcopy(body)
+        render(body, "/echo/a")
+        self.assertEqual(body, snapshot)
+
+
+INVALID_BODY_MODE_CASES = [
+    # (说明, 非法 bodyMode 值)
+    ('"Template"（大小写不符）', "Template"),
+    ('"TEMPLATE"（全大写）', "TEMPLATE"),
+    ('"fixed "（尾随空格）', "fixed "),
+    ('" template"（前导空格）', " template"),
+    ('"Template" 之外的空字符串', ""),
+    ("null", None),
+    ("整数 1", 1),
+    ("布尔 true", True),
+    ("数组 [\"template\"]", ["template"]),
+    ("对象 {\"mode\": \"template\"}", {"mode": "template"}),
+]
+
+
+class BodyModeRulesValidationTests(unittest.TestCase):
+    """bodyMode 只接受区分大小写的 fixed/template；其他值启动期拒绝。"""
+
+    def test_load_rules_rejects_invalid_body_mode(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_mode) in enumerate(INVALID_BODY_MODE_CASES):
+                with self.subTest(非法值=label):
+                    rules_path = write_rules(
+                        tmp, f"rules_bad_bodymode_{index}.json",
+                        [{"method": "GET", "path": "/x",
+                          "bodyMode": bad_mode, "body": 1}],
+                    )
+                    with self.assertRaises(RulesError) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn(
+                        "routes[0].bodyMode", message,
+                        f"样例 {label}: 错误应标明 routes[0].bodyMode，"
+                        f"实际消息={message!r}",
+                    )
+                    self.assertIn(
+                        "fixed", message,
+                        f"样例 {label}: 错误消息应列出合法取值，"
+                        f"实际消息={message!r}",
+                    )
+                    self.assertIn("template", message)
+
+    def test_cli_rejects_with_exit_code_2_and_location(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_mode) in enumerate(INVALID_BODY_MODE_CASES):
+                with self.subTest(非法值=label):
+                    rules_path = write_rules(
+                        tmp, f"rules_cli_bad_bodymode_{index}.json",
+                        [
+                            {"method": "GET", "path": "/x",
+                             "bodyMode": bad_mode, "body": 1},
+                            # 非法项之后的合法路由不应让规则部分加载
+                            {"method": "GET", "path": "/ok", "body": 2},
+                        ],
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    # 标准错误须指出路由位置与 bodyMode 字段
+                    self.assertIn("routes[0]", stderr)
+                    self.assertIn("bodyMode", stderr)
+                    self.assertNotIn("Traceback", stderr)
+                    self.assertNotIn(STARTUP_MARKER, stdout)
+
+    def test_later_route_location_reported(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_bad_bodymode_later.json",
+                [
+                    {"method": "GET", "path": "/ok", "body": 1},
+                    {"method": "GET", "path": "/bad",
+                     "bodyMode": "Template", "body": 2},
+                ],
+            )
+            with self.assertRaises(RulesError) as ctx:
+                load_rules(rules_path)
+            self.assertIn("routes[1].bodyMode", str(ctx.exception))
+
+
+class BodyModeValidLoadingTests(unittest.TestCase):
+    """合法对照：省略/fixed/template 均加载，body_modes 与存储格式正确。"""
+
+    def test_body_modes_recorded_for_every_route(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_bodymodes_ok.json",
+                [
+                    {"method": "GET", "path": "/omit",
+                     "body": {"p": "{{request.path}}"}},
+                    {"method": "GET", "path": "/fixed",
+                     "bodyMode": "fixed", "body": "{{request.path}}"},
+                    {"method": "GET", "path": "/tpl",
+                     "bodyMode": "template",
+                     "body": {"p": "{{request.path}}"}},
+                    {"method": "GET", "path": "/tplnull",
+                     "bodyMode": "template", "body": None},
+                ],
+            )
+            routes = load_rules(rules_path)
+            self.assertEqual(routes.body_modes[("GET", "/omit")], "fixed")
+            self.assertEqual(routes.body_modes[("GET", "/fixed")], "fixed")
+            self.assertEqual(routes.body_modes[("GET", "/tpl")], "template")
+            self.assertEqual(
+                routes.body_modes[("GET", "/tplnull")], "template"
+            )
+            # body_modes 的键集合与路由本身一致
+            self.assertEqual(set(routes.body_modes), set(routes))
+
+    def test_fixed_stores_bytes_template_stores_parsed_value(self):
+        import json as _json
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_bodymodes_storage.json",
+                [
+                    {"method": "GET", "path": "/f",
+                     "body": {"p": "{{request.path}}"}},
+                    {"method": "GET", "path": "/fnull", "body": None},
+                    {"method": "GET", "path": "/t", "bodyMode": "template",
+                     "body": {"p": "{{request.path}}", "n": 1}},
+                    {"method": "GET", "path": "/ts", "bodyMode": "template",
+                     "body": "{{request.path}}"},
+                    {"method": "GET", "path": "/tnull",
+                     "bodyMode": "template", "body": None},
+                ],
+            )
+            routes = load_rules(rules_path)
+            # fixed：保持原有返回格式——预序列化的紧凑 UTF-8 字节
+            self.assertEqual(
+                routes[("GET", "/f")],
+                (200, b'{"p":"{{request.path}}"}'),
+            )
+            self.assertEqual(routes[("GET", "/fnull")], (200, b"null"))
+            # template：保留解析后的 JSON 值供每次请求渲染
+            self.assertEqual(
+                routes[("GET", "/t")],
+                (200, {"p": "{{request.path}}", "n": 1}),
+            )
+            self.assertEqual(routes[("GET", "/ts")], (200, "{{request.path}}"))
+            # template 的 null 是解析值 None，而非字节 b"null"
+            self.assertEqual(routes[("GET", "/tnull")], (200, None))
+            self.assertIsNone(routes[("GET", "/tnull")][1])
+            # fixed 字节与紧凑序列化完全一致（向后兼容）
+            expected = _json.dumps(
+                {"p": "{{request.path}}"},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            self.assertEqual(routes[("GET", "/f")][1], expected)
+
+
+# 端到端验收所用规则：模板前缀回显、fixed 对照、嵌套模板、
+# 受 requestBody 保护的模板 POST（含不回退的根前缀）、
+# 模板延迟/错误状态路由，以及验证 exact 优先的固定路由
+TEMPLATE_RULES = [
+    {"method": "GET", "path": "/echo/", "pathMode": "prefix",
+     "bodyMode": "template", "body": "{{request.path}}"},
+    {"method": "GET", "path": "/static/", "pathMode": "prefix",
+     "body": "{{request.path}}"},
+    {"method": "GET", "path": "/obj", "bodyMode": "template",
+     "body": {
+         "path": "{{request.path}}?q",
+         "nested": ["{{request.path}}", 1,
+                    {"k 键": "你好 {{request.path}}"}],
+         "variants": "{{ request.path }}|{{Request.Path}}|{{x}}",
+         "key {{request.path}}": "键不变",
+         "n": 2.5,
+         "b": False,
+         "nil": None,
+     }},
+    {"method": "GET", "path": "/slowt", "bodyMode": "template",
+     "delayMs": 120, "status": 503,
+     "body": {"p": "{{request.path}}"}},
+    {"method": "POST", "path": "/pe/", "pathMode": "prefix",
+     "bodyMode": "template", "requestBodyMode": "subset",
+     "requestBody": {"ok": 1},
+     "body": {"path": "{{request.path}}"}},
+    {"method": "POST", "path": "/", "pathMode": "prefix",
+     "bodyMode": "template", "body": "{{request.path}}"},
+    {"method": "GET", "path": "/echo/exact",
+     "body": {"v": "fixed-exact"}},
+]
+
+
+class PathTemplateEchoTests(unittest.TestCase):
+    """端到端：template 路由按本次匹配路径回显，其余行为全部沿用既有语义。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_template.json", TEMPLATE_RULES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _check(self, label, method, target, expected_status, expected_body,
+               request_body=None):
+        status, headers, raw = request(
+            self.port, method, target, body=request_body
+        )
+        self.assertEqual(
+            status, expected_status,
+            f"样例 {label}: 状态码应为 {expected_status}，实际 {status}；"
+            f"响应={raw!r}",
+        )
+        self.assertEqual(
+            headers.get("Content-Type"), CONTENT_TYPE,
+            f"样例 {label}: Content-Type 不符，实际 {headers}",
+        )
+        # Content-Length 始终按实际（替换后的）UTF-8 字节数给出
+        self.assertEqual(
+            int(headers["Content-Length"]), len(raw),
+            f"样例 {label}: Content-Length 与实际字节数不符",
+        )
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), expected_body,
+            f"样例 {label}: 响应体应为 {expected_body!r}，实际 {raw!r}",
+        )
+        return raw
+
+    def test_task_acceptance_echo_percent_encoded_path(self):
+        # 任务给定的验收样例
+        status, headers, raw = request(
+            self.port, "GET", "/echo/a%20b?x=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, b'"/echo/a%20b"')
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+        self.assertEqual(json.loads(raw.decode("utf-8")), "/echo/a%20b")
+
+    def test_each_request_echoes_its_own_path(self):
+        self._check("第一次", "GET", "/echo/a", 200, "/echo/a")
+        self._check("第二次", "GET", "/echo/b/c", 200, "/echo/b/c")
+        # 模板值在多条请求间共享，渲染必须基于副本：连续请求互不污染
+        self._check("再来一次", "GET", "/echo/a?y=2", 200, "/echo/a")
+
+    def test_path_literal_preserved_case_slash_percent(self):
+        # 去除查询串，保留大小写、尾斜杠与百分号转义，不解码不规范化
+        self._check(
+            "大小写/尾斜杠/%转义", "GET", "/echo/A%20B/?x=1",
+            200, "/echo/A%20B/",
+        )
+        self._check(
+            "无查询串的尾斜杠", "GET", "/echo/",
+            404, {"error": "route_not_found"},
+        )
+
+    def test_nested_strings_replaced_keys_and_scalars_unchanged(self):
+        status, headers, raw = request(self.port, "GET", "/obj?ignored=1")
+        self.assertEqual(status, 200)
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body["path"], "/obj?q")
+        self.assertEqual(
+            body["nested"], ["/obj", 1, {"k 键": "你好 /obj"}]
+        )
+        # 带空格/大小写不同的写法与其他占位符保持原样
+        self.assertEqual(
+            body["variants"],
+            "{{ request.path }}|{{Request.Path}}|{{x}}",
+        )
+        # 对象键不替换，非字符串值与结构不变
+        self.assertIn("key {{request.path}}", body)
+        self.assertEqual(body["key {{request.path}}"], "键不变")
+        self.assertEqual(body["n"], 2.5)
+        self.assertIs(body["b"], False)
+        self.assertIsNone(body["nil"])
+        # 含中文的静态内容：字节数按替换后的 UTF-8 JSON 计算。
+        # 键顺序沿用规则文件，故不逐字比较（键集合与各值上面已核对），
+        # 而是把解析结果按同样的紧凑参数重新序列化后比较字节长度：
+        # 键与字符串内容相同，紧凑 JSON 的字节数与键序无关
+        expected_length = len(
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        self.assertEqual(len(raw), expected_length)
+        self.assertEqual(int(headers["Content-Length"]), expected_length)
+
+    def test_fixed_routes_keep_placeholder_verbatim(self):
+        # 省略 bodyMode 即 fixed：即使字符串含占位符也原样返回
+        self._check(
+            "fixed 前缀原样返回占位符", "GET", "/static/abc?x=1",
+            200, "{{request.path}}",
+        )
+        # exact 固定路由优先于模板前缀：不参与渲染
+        self._check(
+            "exact 优先于模板前缀", "GET", "/echo/exact?x=1",
+            200, {"v": "fixed-exact"},
+        )
+
+    def test_template_route_uses_configured_status_and_delay(self):
+        started = time.monotonic()
+        status, headers, raw = request(self.port, "GET", "/slowt?x=1")
+        elapsed = time.monotonic() - started
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), {"p": "/slowt"}
+        )
+        self.assertGreaterEqual(elapsed, 0.12)
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_post_template_matching_body_renders_configured_response(self):
+        self._check(
+            "subset 校验通过：200 且回显路径",
+            "POST", "/pe/x?z=1", 200, {"path": "/pe/x"},
+            request_body=b'{"ok":1,"extra":2}',
+        )
+
+    def test_post_mismatch_returns_400_without_template_or_fallback(self):
+        # 校验失败：400 固定错误体，不渲染模板、不应用状态/延迟，
+        # 也不回退到同样匹配该路径的根前缀 POST 模板
+        status, headers, raw = request(
+            self.port, "POST", "/pe/x", body=b'{"ok":2}'
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_root_prefix_template_serves_other_post_paths(self):
+        self._check(
+            "根前缀模板回显 POST 路径", "POST", "/other/x", 200, "/other/x"
+        )
+
+    def test_miss_returns_404(self):
+        self._check(
+            "GET 无根前缀：未命中", "GET", "/nope",
+            404, {"error": "route_not_found"},
+        )
+
+    def test_other_methods_keep_501_behavior(self):
+        for method in ("PUT", "DELETE", "OPTIONS", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, raw = request(
+                    self.port, method, "/echo/x"
+                )
+                self.assertEqual(status, 501)
+                self.assertEqual(
+                    raw, b'{"error":"method_not_supported"}'
+                )
+
+    def test_head_keeps_501_headers_without_body(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=REQUEST_TIMEOUT)
+        try:
+            conn.request("HEAD", "/echo/x")
+            resp = conn.getresponse()
+            raw = resp.read()
+            self.assertEqual(resp.status, 501)
+            self.assertEqual(raw, b"")
+            self.assertEqual(
+                int(resp.getheader("Content-Length")),
+                len(b'{"error":"method_not_supported"}'),
+            )
+        finally:
+            conn.close()
+
+
+class BodyModeBackwardCompatibilityTests(unittest.TestCase):
+    """旧规则无需补字段：自带 rules.json 全部按 fixed 加载且字节不变。"""
+
+    def test_shipped_rules_load_as_fixed_and_serve(self):
+        rules_path = PROJECT_ROOT / "rules.json"
+        from mock_server import load_rules
+
+        routes = load_rules(rules_path)
+        self.assertTrue(routes)
+        self.assertTrue(
+            all(mode == "fixed" for mode in routes.body_modes.values())
+        )
+        self.assertEqual(set(routes.body_modes), set(routes))
+        port = free_port()
+        server = ServerProcess(rules_path, port)
+        try:
+            status, headers, raw = request(port, "GET", "/hello?x=1")
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, '{"message":"你好"}'.encode("utf-8"))
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+        finally:
+            server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
