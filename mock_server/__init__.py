@@ -233,8 +233,242 @@ def _render_template(value, path, method, query):
     return value
 
 
+# ---------------------------------------------------------------------------
+# 规则加载拆为两层，便于分别审阅一条规则被接受或拒绝的依据：
+#
+# 文件级检查（针对整份文件，任一失败即拒绝整份文件，路由级检查不会执行）：
+#   _read_rules_file      读取字节并按 UTF-8 解码
+#   _parse_rules_document JSON 语法检查与整份文档的非有限数字检查
+#   _extract_route_items  顶层结构检查（对象 + routes 数组）
+#
+# 路由级检查（按数组顺序逐条进行，同一文件存在多个错误时报告第一个）：
+#   _validate_route       校验单条路由并预序列化 body，返回登记所需配置
+#   _build_routes         逐条校验并组装为 Routes
+#   _register_route       把一条已接受的路由登记进 Routes 及其附加映射
+# ---------------------------------------------------------------------------
+
+
+def _read_rules_file(path):
+    """文件级检查之一：读取规则文件原始字节并按 UTF-8 解码。"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as exc:
+        raise RulesError(f"cannot read rules file {path!r}: {exc.strerror or exc}")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RulesError(f"rules file {path!r} is not valid UTF-8: {exc}")
+
+
+def _parse_rules_document(path, text):
+    """文件级检查之二：JSON 解析并对整份文档做非有限数字检查。
+
+    json.loads 借 parse_constant 拒绝 NaN/Infinity/-Infinity 三种非标准
+    字面量；语法合法但解析为 inf/-inf 的数字（如 1e400，下溢为 0 不算）
+    无法序列化回合法 JSON，由 _ensure_finite_numbers 递归整份文档
+    （含会被忽略的额外字段）拒绝。
+    """
+    try:
+        data = json.loads(text, parse_constant=_reject_constant)
+    except ValueError as exc:
+        # JSONDecodeError 与非标准字面量（ValueError）统一归为 JSON 格式错误
+        raise RulesError(f"rules file {path!r} is not valid JSON: {exc}")
+    try:
+        _ensure_finite_numbers(data)
+    except ValueError as exc:
+        raise RulesError(f"rules file {path!r} {exc}")
+    return data
+
+
+def _extract_route_items(data):
+    """文件级检查之三：顶层须为对象且含 routes 数组，返回该数组。"""
+    if not isinstance(data, dict) or not isinstance(data.get("routes"), list):
+        raise RulesError("rules file must be a JSON object with a 'routes' array")
+    return data["routes"]
+
+
+def _validate_route(item, where, existing_keys):
+    """路由级检查：校验 routes 数组中的一项，返回登记所需的全部配置。
+
+    检查顺序与错误消息与原有内联流程逐项一致，保证同一文件存在多个错误
+    时首先报告的错误不变：对象类型与必填字段 -> method -> path ->
+    method+path 唯一性 -> pathMode（含 prefix 尾斜杠）-> bodyMode ->
+    requestBodyMode -> requestBody -> status -> delayMs -> body 的 UTF-8
+    预序列化。返回字典仅描述“该路由被接受后的配置”，不修改任何全局状态；
+    唯一性通过 existing_keys 只读判断。
+    """
+    if not isinstance(item, dict):
+        raise RulesError(f"{where} must be an object")
+    for field in ("method", "path", "body"):
+        if field not in item:
+            raise RulesError(f"{where} is missing required field {field!r}")
+    method = item["method"]
+    if method not in ALLOWED_METHODS:
+        raise RulesError(
+            f"{where}: method must be 'GET' or 'POST', got {method!r}"
+        )
+    route_path = item["path"]
+    if (
+        not isinstance(route_path, str)
+        or not route_path.startswith("/")
+        or "?" in route_path
+        or "#" in route_path
+    ):
+        raise RulesError(
+            f"{where}: path must be a string starting with '/' "
+            f"and contain no '?' or '#', got {route_path!r}"
+        )
+    key = (method, route_path)
+    if key in existing_keys:
+        raise RulesError(f"{where}: duplicate route {method} {route_path}")
+    path_mode = item.get("pathMode", "exact")
+    if not isinstance(path_mode, str) or path_mode not in PATH_MODES:
+        # 其他字符串（含 "Exact"、"PREFIX"）或非字符串值（null、布尔、
+        # 数字、数组、对象）一律拒绝；取值区分大小写
+        raise RulesError(
+            f"{where}.pathMode must be 'exact' or 'prefix', "
+            f"got {path_mode!r}"
+        )
+    if path_mode == "prefix" and not route_path.endswith("/"):
+        # prefix 沿用 path 的原有限制，另外要求以 / 结尾（根路径 / 也
+        # 允许）；exact 路径不做此要求
+        raise RulesError(
+            f"{where}.path for pathMode 'prefix' must end with '/', "
+            f"got {route_path!r}"
+        )
+    body_mode = item.get("bodyMode", "fixed")
+    if not isinstance(body_mode, str) or body_mode not in BODY_MODES:
+        # 其他字符串（含 "Fixed"、"TEMPLATE"）或非字符串值（null、
+        # 布尔、数字、数组、对象）一律拒绝；取值区分大小写
+        raise RulesError(
+            f"{where}.bodyMode must be 'fixed' or 'template', "
+            f"got {body_mode!r}"
+        )
+    request_body_sample = None
+    if "requestBodyMode" in item:
+        # 只允许与 POST 路由的显式 requestBody 一起出现（requestBody
+        # 为 null 也算显式存在）；取值必须是区分大小写的 "exact" 或
+        # "subset"，其他值一律拒绝
+        if method != "POST" or "requestBody" not in item:
+            raise RulesError(
+                f"{where}.requestBodyMode is only allowed together with "
+                f"an explicit requestBody on a POST route"
+            )
+        mode = item["requestBodyMode"]
+        if mode not in REQUEST_BODY_MODES:
+            raise RulesError(
+                f"{where}.requestBodyMode must be 'exact' or 'subset', "
+                f"got {mode!r}"
+            )
+    has_request_body = "requestBody" in item
+    if has_request_body:
+        if method != "POST":
+            raise RulesError(
+                f"{where}.requestBody is only allowed on POST routes, "
+                f"got method {method!r}"
+            )
+        try:
+            # 与 body 相同的 UTF-8 可编码限制：样例中的字符串值与对象
+            # 键都不得含未配对代理码点。样例仅用于按值比较，无需预序列化
+            json.dumps(
+                item["requestBody"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RulesError(
+                f"{where}.requestBody cannot be encoded as UTF-8: {exc}"
+            )
+        request_body_sample = item["requestBody"]
+    status = item.get("status", 200)
+    if not _valid_status(status):
+        raise RulesError(
+            f"{where}: status must be the integer 200 or an integer "
+            f"between 400 and 599, got {status!r}"
+        )
+    delay_ms = item.get("delayMs", 0)
+    if not _valid_delay_ms(delay_ms):
+        raise RulesError(
+            f"{where}: delayMs must be an integer between 0 and 2000 "
+            f"(inclusive), got {delay_ms!r}"
+        )
+    try:
+        body = json.dumps(
+            item["body"], ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # body 中的字符串值或对象键含未配对的代理码点（如孤立 \ud800、
+        # 方向颠倒的代理对）时无法编码为合法 UTF-8 响应；与既有规则
+        # 错误一致，整份规则加载失败
+        raise RulesError(
+            f"{where}.body cannot be encoded as UTF-8: {exc}"
+        )
+    return {
+        "key": key,
+        "status": status,
+        "body": body,
+        "delay_ms": delay_ms,
+        "path_mode": path_mode,
+        "body_mode": body_mode,
+        # 模板路由保留 body 的原始 JSON 值，每次命中按当前方法与路径
+        # 渲染；上面的序列化已保证其中字符串值与对象键可编码为 UTF-8
+        "template_body": item["body"] if body_mode == "template" else None,
+        # requestBody 为 null 也算显式存在，故以 has_request_body 而非
+        # 样例值是否为 None 区分
+        "has_request_body": has_request_body,
+        "request_body_sample": request_body_sample,
+        "request_body_mode": item.get("requestBodyMode", "exact"),
+    }
+
+
+def _empty_routes():
+    """构造附带全部附加配置映射的空 Routes。"""
+    routes = Routes()
+    routes.delays = {}
+    routes.request_bodies = {}
+    routes.request_body_modes = {}
+    routes.path_modes = {}
+    routes.body_modes = {}
+    routes.template_bodies = {}
+    return routes
+
+
+def _register_route(routes, entry):
+    """把一条通过校验的路由及其附加配置登记进 Routes。"""
+    key = entry["key"]
+    routes[key] = (entry["status"], entry["body"])
+    routes.delays[key] = entry["delay_ms"]
+    routes.path_modes[key] = entry["path_mode"]
+    routes.body_modes[key] = entry["body_mode"]
+    if entry["body_mode"] == "template":
+        routes.template_bodies[key] = entry["template_body"]
+    if entry["has_request_body"]:
+        routes.request_bodies[key] = entry["request_body_sample"]
+        routes.request_body_modes[key] = entry["request_body_mode"]
+
+
+def _build_routes(items):
+    """路由级检查与返回值组装：逐条校验后按原顺序登记，失败即整份拒绝。
+
+    任一一条路由校验失败都不会返回部分结果；existing 键集合即当前已
+    接受的路由，故重复的 method+path（即使路径模式不同）由后出现的一条
+    报 duplicate route。
+    """
+    routes = _empty_routes()
+    for index, item in enumerate(items):
+        entry = _validate_route(item, f"routes[{index}]", routes)
+        _register_route(routes, entry)
+    return routes
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 Routes：{(method, path): (状态码, 响应字节)}。
+
+    加载流程分两层：文件级检查（读取与 UTF-8 解码、JSON 语法与整份文档
+    的非有限数字检查、顶层对象与 routes 数组结构）先于路由级检查执行；
+    路由级检查按数组顺序逐条进行，任一失败即抛出 RulesError，不返回部分
+    路由。
 
     返回值的 delays 属性为 {(method, path): 延迟毫秒数} 映射；
     request_bodies 属性为 {(method, path): requestBody 样例值} 映射，
@@ -250,156 +484,10 @@ def load_rules(path):
     仅包含 bodyMode 为 "template" 的路由，供每次命中按当前方法、路径与
     查询串渲染。
     """
-    try:
-        with open(path, "rb") as f:
-            raw = f.read()
-    except OSError as exc:
-        raise RulesError(f"cannot read rules file {path!r}: {exc.strerror or exc}")
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise RulesError(f"rules file {path!r} is not valid UTF-8: {exc}")
-    try:
-        data = json.loads(text, parse_constant=_reject_constant)
-    except ValueError as exc:
-        # JSONDecodeError 与非标准字面量（ValueError）统一归为 JSON 格式错误
-        raise RulesError(f"rules file {path!r} is not valid JSON: {exc}")
-    try:
-        _ensure_finite_numbers(data)
-    except ValueError as exc:
-        # 语法合法但解析为 inf/-inf 的数字（如 1e400）同样无法产出合法 JSON，
-        # 整份规则拒绝加载
-        raise RulesError(f"rules file {path!r} {exc}")
-
-    if not isinstance(data, dict) or not isinstance(data.get("routes"), list):
-        raise RulesError("rules file must be a JSON object with a 'routes' array")
-
-    routes = Routes()
-    routes.delays = {}
-    routes.request_bodies = {}
-    routes.request_body_modes = {}
-    routes.path_modes = {}
-    routes.body_modes = {}
-    routes.template_bodies = {}
-    for index, item in enumerate(data["routes"]):
-        where = f"routes[{index}]"
-        if not isinstance(item, dict):
-            raise RulesError(f"{where} must be an object")
-        for field in ("method", "path", "body"):
-            if field not in item:
-                raise RulesError(f"{where} is missing required field {field!r}")
-        method = item["method"]
-        if method not in ALLOWED_METHODS:
-            raise RulesError(
-                f"{where}: method must be 'GET' or 'POST', got {method!r}"
-            )
-        route_path = item["path"]
-        if (
-            not isinstance(route_path, str)
-            or not route_path.startswith("/")
-            or "?" in route_path
-            or "#" in route_path
-        ):
-            raise RulesError(
-                f"{where}: path must be a string starting with '/' "
-                f"and contain no '?' or '#', got {route_path!r}"
-            )
-        key = (method, route_path)
-        if key in routes:
-            raise RulesError(f"{where}: duplicate route {method} {route_path}")
-        path_mode = item.get("pathMode", "exact")
-        if not isinstance(path_mode, str) or path_mode not in PATH_MODES:
-            # 其他字符串（含 "Exact"、"PREFIX"）或非字符串值（null、布尔、
-            # 数字、数组、对象）一律拒绝；取值区分大小写
-            raise RulesError(
-                f"{where}.pathMode must be 'exact' or 'prefix', "
-                f"got {path_mode!r}"
-            )
-        if path_mode == "prefix" and not route_path.endswith("/"):
-            # prefix 沿用 path 的原有限制，另外要求以 / 结尾（根路径 / 也
-            # 允许）；exact 路径不做此要求
-            raise RulesError(
-                f"{where}.path for pathMode 'prefix' must end with '/', "
-                f"got {route_path!r}"
-            )
-        body_mode = item.get("bodyMode", "fixed")
-        if not isinstance(body_mode, str) or body_mode not in BODY_MODES:
-            # 其他字符串（含 "Fixed"、"TEMPLATE"）或非字符串值（null、
-            # 布尔、数字、数组、对象）一律拒绝；取值区分大小写
-            raise RulesError(
-                f"{where}.bodyMode must be 'fixed' or 'template', "
-                f"got {body_mode!r}"
-            )
-        request_body_sample = None
-        if "requestBodyMode" in item:
-            # 只允许与 POST 路由的显式 requestBody 一起出现（requestBody
-            # 为 null 也算显式存在）；取值必须是区分大小写的 "exact" 或
-            # "subset"，其他值一律拒绝
-            if method != "POST" or "requestBody" not in item:
-                raise RulesError(
-                    f"{where}.requestBodyMode is only allowed together with "
-                    f"an explicit requestBody on a POST route"
-                )
-            mode = item["requestBodyMode"]
-            if mode not in REQUEST_BODY_MODES:
-                raise RulesError(
-                    f"{where}.requestBodyMode must be 'exact' or 'subset', "
-                    f"got {mode!r}"
-                )
-        if "requestBody" in item:
-            if method != "POST":
-                raise RulesError(
-                    f"{where}.requestBody is only allowed on POST routes, "
-                    f"got method {method!r}"
-                )
-            try:
-                # 与 body 相同的 UTF-8 可编码限制：样例中的字符串值与对象
-                # 键都不得含未配对代理码点。样例仅用于按值比较，无需预序列化
-                json.dumps(
-                    item["requestBody"],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise RulesError(
-                    f"{where}.requestBody cannot be encoded as UTF-8: {exc}"
-                )
-            request_body_sample = item["requestBody"]
-        status = item.get("status", 200)
-        if not _valid_status(status):
-            raise RulesError(
-                f"{where}: status must be the integer 200 or an integer "
-                f"between 400 and 599, got {status!r}"
-            )
-        delay_ms = item.get("delayMs", 0)
-        if not _valid_delay_ms(delay_ms):
-            raise RulesError(
-                f"{where}: delayMs must be an integer between 0 and 2000 "
-                f"(inclusive), got {delay_ms!r}"
-            )
-        try:
-            body = json.dumps(
-                item["body"], ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
-        except UnicodeEncodeError as exc:
-            # body 中的字符串值或对象键含未配对的代理码点（如孤立 \ud800、
-            # 方向颠倒的代理对）时无法编码为合法 UTF-8 响应；与既有规则
-            # 错误一致，整份规则加载失败
-            raise RulesError(
-                f"{where}.body cannot be encoded as UTF-8: {exc}"
-            )
-        routes[key] = (status, body)
-        routes.delays[key] = delay_ms
-        routes.path_modes[key] = path_mode
-        routes.body_modes[key] = body_mode
-        if body_mode == "template":
-            # 模板路由保留 body 的原始 JSON 值，每次命中按当前方法与路径
-            # 渲染；上面的序列化已保证其中字符串值与对象键可编码为 UTF-8
-            routes.template_bodies[key] = item["body"]
-        if "requestBody" in item:
-            routes.request_bodies[key] = request_body_sample
-            routes.request_body_modes[key] = item.get("requestBodyMode", "exact")
-    return routes
+    text = _read_rules_file(path)
+    data = _parse_rules_document(path, text)
+    items = _extract_route_items(data)
+    return _build_routes(items)
 
 
 def _make_handler(routes):
