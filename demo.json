@@ -1,0 +1,25 @@
+{
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/files/",
+      "pathMode": "prefix",
+      "bodyMode": "template",
+      "body": {"suffix": "{{request.pathSuffix}}"}
+    },
+    {
+      "method": "GET",
+      "path": "/files/images/",
+      "pathMode": "prefix",
+      "bodyMode": "template",
+      "body": {"suffix": "{{request.pathSuffix}}"}
+    },
+    {
+      "method": "GET",
+      "path": "/files/ping",
+      "pathMode": "exact",
+      "bodyMode": "template",
+      "body": {"suffix": "{{request.pathSuffix}}"}
+    }
+  ]
+}
