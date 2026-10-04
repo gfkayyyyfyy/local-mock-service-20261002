@@ -4513,6 +4513,152 @@ class PrefixRequestBodyTests(unittest.TestCase):
         self.assertEqual(raw, b'{"get":1}')
 
 
+# ---------------------------------------------------------------------------
+# 多条路由竞争时只校验最终选中路由的真实 HTTP 回归
+#
+# 同一份包含三条 POST 路由的临时规则分别按文件原顺序与逆序各启动一个
+# 服务，锁定“先按 exact 优先、最长前缀其次选出唯一路由，再只按该路由的
+# requestBody 校验；校验失败返回 400，绝不回退尝试其他候选”：
+#   POST prefix /        不配置 requestBody，200 + JSON 字符串 "root"
+#   POST prefix /api/    requestBodyMode=subset、样例 {"v":1}，503 + "prefix"
+#   POST exact  /api/item 默认整体比较、样例 {"v":9}，200 + "exact"
+# 其中 POST /api/ 对前缀 /api/ 剩余为空（不参与竞争），仅对根前缀剩余
+# 非空：以非 JSON 正文请求时应得到根前缀响应。
+# ---------------------------------------------------------------------------
+
+ROUTE_COMPETITION_RULES = [
+    {"method": "POST", "path": "/", "pathMode": "prefix",
+     "body": "root"},
+    {"method": "POST", "path": "/api/", "pathMode": "prefix",
+     "requestBodyMode": "subset", "requestBody": {"v": 1},
+     "status": 503, "body": "prefix"},
+    {"method": "POST", "path": "/api/item",
+     "requestBody": {"v": 9}, "body": "exact"},
+]
+
+# (说明, 请求目标（含查询串）, 请求正文, 预期状态码, 预期响应 JSON 值)
+ROUTE_COMPETITION_CASES = [
+    # exact /api/item 优先于前缀 /api/：正文满足 exact 样例 {"v":9}，
+    # 返回精确响应，查询串不影响匹配
+    ("精确路径命中：{\"v\":9} 返回 200 \"exact\"",
+     "/api/item?x=1", b'{"v":9}', 200, "exact"),
+    # 同一正文 {"v":1} 能通过前缀的 subset 样例，但 exact 已被选中：
+    # 必须按 exact 自己的样例校验并返回 400，不能改用前缀的 503
+    ("精确路径按自身样例校验失败：{\"v\":1} 返回 400，不回退前缀",
+     "/api/item?x=1", b'{"v":1}', 400,
+     {"error": "request_body_mismatch"}),
+    # 其他 /api/* 路径由最长前缀 /api/ 选中：subset 允许额外键
+    ("前缀命中：subset 允许额外键，返回 503 \"prefix\"",
+     "/api/other", b'{"v":1,"extra":true}', 503, "prefix"),
+    # 以下正文均通不过前缀的 subset 校验：必须 400，不能回退到无样例的
+    # 根前缀返回 200 "root"
+    ("前缀校验失败：正文缺少 v 键，返回 400 而非根前缀响应",
+     "/api/other", b'{}', 400, {"error": "request_body_mismatch"}),
+    ("前缀校验失败：v 改为布尔 true（布尔不等于数字），返回 400",
+     "/api/other", b'{"v":true}', 400,
+     {"error": "request_body_mismatch"}),
+    ("前缀校验失败：额外字段放入非有限数字 1e400，返回 400",
+     "/api/other", b'{"v":1,"extra":1e400}', 400,
+     {"error": "request_body_mismatch"}),
+    # /api/ 对前缀 /api/ 剩余为空，该前缀不参与竞争；根前缀剩余 "api/"
+    # 非空且未配置 requestBody，忽略非 JSON 正文返回 200 "root"
+    ("剩余路径为空的前缀不参与竞争：非 JSON 正文回退根前缀",
+     "/api/", b"not json", 200, "root"),
+]
+
+
+class SelectedRouteOnlyValidationTests(unittest.TestCase):
+    """多路由竞争：只校验最终选中的路由；规则原顺序与逆序预期完全一致。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        # 临时目录（含两份仅顺序不同的规则文件）在类结束时无条件清理，
+        # 即使后续断言失败也会执行
+        cls.addClassCleanup(cls._tmp.cleanup)
+        # 同一份三条路由规则：按文件原顺序与逆序分别启动独立服务；
+        # addClassCleanup 保证任一断言失败后服务进程仍被回收
+        cls.servers = []
+        for index, (order_label, routes) in enumerate((
+            ("规则原顺序", ROUTE_COMPETITION_RULES),
+            ("规则逆序", list(reversed(ROUTE_COMPETITION_RULES))),
+        )):
+            rules_path = write_rules(
+                cls._tmp.name,
+                f"rules_route_competition_{index}.json",
+                routes,
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            cls.servers.append((order_label, port, server))
+            cls.addClassCleanup(server.stop)
+
+    def _assert_exchange(self, order_label, port, label, target, raw_body,
+                         expected_status, expected_json):
+        """发起一次 POST 并核对状态、JSON 内容、Content-Type、Content-Length。
+
+        失败信息统一附带规则顺序、请求路径与请求正文，并对照给出预期
+        响应与实际响应的差异，便于直接定位是哪条路由被错误选中。
+        """
+        expected_raw = json.dumps(
+            expected_json, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        context = (
+            f"[{order_label}] 样例 {label}：POST {target}，"
+            f"请求正文 {raw_body!r}"
+        )
+        # request() 在 finally 中关闭连接，断言失败也不泄漏连接
+        status, headers, raw = request(port, "POST", target, body=raw_body)
+        self.assertEqual(
+            status, expected_status,
+            f"{context}：预期状态码 {expected_status} 与响应 "
+            f"{expected_raw!r}，实际状态码 {status} 与响应 {raw!r}",
+        )
+        content_type = headers.get("Content-Type")
+        self.assertEqual(
+            content_type, CONTENT_TYPE,
+            f"{context}：预期 Content-Type {CONTENT_TYPE!r}，"
+            f"实际 {content_type!r}；实际响应={raw!r}",
+        )
+        content_length = headers.get("Content-Length")
+        self.assertIsNotNone(
+            content_length,
+            f"{context}：响应缺少 Content-Length；实际响应={raw!r}",
+        )
+        self.assertEqual(
+            int(content_length), len(raw),
+            f"{context}：预期 Content-Length 等于实际响应字节数 "
+            f"{len(raw)}，实际 Content-Length={content_length!r}；"
+            f"实际响应={raw!r}",
+        )
+        self.assertEqual(
+            raw, expected_raw,
+            f"{context}：预期响应字节 {expected_raw!r}（JSON 值 "
+            f"{expected_json!r}），实际响应字节 {raw!r}",
+        )
+        actual_json = json.loads(raw.decode("utf-8"))
+        self.assertEqual(
+            actual_json, expected_json,
+            f"{context}：预期响应 JSON {expected_json!r}，"
+            f"实际解析为 {actual_json!r}",
+        )
+
+    def test_same_expectations_under_original_and_reversed_rule_order(self):
+        # 逐顺序、逐用例核对：subTest 使单个用例失败不影响其余用例执行，
+        # 服务进程与临时文件的回收由 addClassCleanup 统一保证
+        for order_label, port, _server in self.servers:
+            for label, target, raw_body, expected_status, expected_json in (
+                ROUTE_COMPETITION_CASES
+            ):
+                with self.subTest(
+                    规则顺序=order_label, 样例=label, request=f"POST {target}"
+                ):
+                    self._assert_exchange(
+                        order_label, port, label, target, raw_body,
+                        expected_status, expected_json,
+                    )
+
+
 # pathMode 规则加载校验：取值必须是区分大小写的 "exact"/"prefix"，且
 # prefix 的 path 必须以 / 结尾；否则 load_rules 抛 RulesError，CLI 退出
 # 码 2 且不监听
