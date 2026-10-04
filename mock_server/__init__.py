@@ -67,10 +67,11 @@ def _port(value):
 
 
 def _valid_status(value):
-    # bool 是 int 的子类，需显式排除；503.0 等浮点数也不接受
+    # bool 是 int 的子类，需显式排除；503.0 等浮点数也不接受。
+    # 2xx 仅接受 200（缺省值）与 201（创建成功），其余 2xx/3xx 一律拒绝
     if not isinstance(value, int) or isinstance(value, bool):
         return False
-    return value == 200 or 400 <= value <= 599
+    return value in (200, 201) or 400 <= value <= 599
 
 
 def _valid_delay_ms(value):
@@ -420,7 +421,7 @@ def _check_route_options(item, where, method, route_path):
     status = item.get("status", 200)
     if not _valid_status(status):
         raise RulesError(
-            f"{where}: status must be the integer 200 or an integer "
+            f"{where}: status must be the integer 200, 201 or an integer "
             f"between 400 and 599, got {status!r}"
         )
     delay_ms = item.get("delayMs", 0)
