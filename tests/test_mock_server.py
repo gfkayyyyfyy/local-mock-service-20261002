@@ -4141,5 +4141,691 @@ class JsonComparisonHelperRefactorTests(unittest.TestCase):
                 )
 
 
+# ---------------------------------------------------------------------------
+# pathMode 前缀匹配回归
+#
+# 路由项可选的 pathMode 取值为区分大小写的 "exact" 或 "prefix"：省略或
+# "exact" 保持完整路径相等；"prefix" 将 path 作为前缀（path 必须以 /
+# 结尾，根路径 / 也允许），请求路径以前缀开头且前缀之后的剩余部分非空
+# 才算候选（剩余部分可含多级路径）。解析顺序：先按请求方法筛选，再优先
+# exact 完整路径相等，其次选 path 最长的 prefix 候选，规则排列顺序不
+# 影响结果。两种模式都忽略查询字符串，路径大小写、尾部斜杠、百分号转义
+# 按原样比较，星号没有特殊含义。
+# ---------------------------------------------------------------------------
+
+PREFIX_RULES = [
+    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+     "body": {"v": 1}},
+    {"method": "GET", "path": "/api/v1/", "pathMode": "prefix",
+     "body": {"v": 2}},
+    {"method": "GET", "path": "/api/v1/ping", "body": {"v": 3}},
+    # 前缀路由同样沿用配置的状态码与延迟
+    {"method": "GET", "path": "/slow/", "pathMode": "prefix",
+     "delayMs": DELAY_MS, "status": 503,
+     "body": {"error": "demo_failure"}},
+]
+
+
+class PrefixMatchingBehaviorTests(unittest.TestCase):
+    """验收场景：exact 优先、最长前缀、剩余非空、方法筛选与字面比较。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_prefix.json", PREFIX_RULES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _check(self, label, method, target, expected_status, expected_body,
+               request_body=None):
+        status, headers, raw = request(
+            self.port, method, target, body=request_body
+        )
+        self.assertEqual(
+            status, expected_status,
+            f"样例 {label}: 状态码应为 {expected_status}，实际 {status}；"
+            f"响应={raw!r}",
+        )
+        self.assertEqual(
+            headers.get("Content-Type"), CONTENT_TYPE,
+            f"样例 {label}: Content-Type 不符，实际 {headers}",
+        )
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), expected_body,
+            f"样例 {label}: 响应体应为 {expected_body}，实际 {raw!r}",
+        )
+
+    def test_task_acceptance_matrix(self):
+        self._check("GET /api/x", "GET", "/api/x", 200, {"v": 1})
+        self._check("GET /api/v1/x", "GET", "/api/v1/x", 200, {"v": 2})
+        # 查询字符串被忽略；exact 完整相等优先于两个前缀候选
+        self._check(
+            "GET /api/v1/ping?x=1", "GET", "/api/v1/ping?x=1",
+            200, {"v": 3},
+        )
+        self._check("GET /api/v1/ping", "GET", "/api/v1/ping", 200, {"v": 3})
+        # /api 不以 /api/ 开头；/api/ 与前缀完全相等（剩余为空）
+        self._check(
+            "GET /api（未命中）", "GET", "/api",
+            404, {"error": "route_not_found"},
+        )
+        self._check(
+            "GET /api/（剩余为空）", "GET", "/api/",
+            404, {"error": "route_not_found"},
+        )
+        # 方法先筛选：GET 前缀不服务 POST
+        self._check(
+            "POST /api/x（方法不同）", "POST", "/api/x",
+            404, {"error": "route_not_found"},
+        )
+
+    def test_exact_is_literal_and_prefixes_cover_neighbors(self):
+        # 尾斜杠与多/少字符都不与 exact 相等，回退到最长前缀
+        self._check(
+            "GET /api/v1/ping/（exact 不等，前缀剩余为 ping/）",
+            "GET", "/api/v1/ping/", 200, {"v": 2},
+        )
+        self._check(
+            "GET /api/v1/pingx（exact 不等，前缀剩余为 pingx）",
+            "GET", "/api/v1/pingx", 200, {"v": 2},
+        )
+
+    def test_remainder_may_contain_multiple_path_segments(self):
+        self._check(
+            "GET /api/a/b/c（单级前缀覆盖多级剩余）",
+            "GET", "/api/a/b/c", 200, {"v": 1},
+        )
+        self._check(
+            "GET /api/v1/a/b/c（最长前缀覆盖多级剩余）",
+            "GET", "/api/v1/a/b/c", 200, {"v": 2},
+        )
+
+    def test_declaration_order_does_not_affect_selection(self):
+        # 逆序声明同样的规则，解析结果必须一致：只按 exact 优先、前缀长度
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_prefix_reversed.json", list(reversed(PREFIX_RULES))
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                for target, expected_body in [
+                    ("/api/x", {"v": 1}),
+                    ("/api/v1/x", {"v": 2}),
+                    ("/api/v1/ping?x=1", {"v": 3}),
+                    ("/api/v1/a/b/c", {"v": 2}),
+                ]:
+                    with self.subTest(target=target):
+                        status, headers, raw = request(port, "GET", target)
+                        self.assertEqual(status, 200)
+                        self.assertEqual(
+                            headers.get("Content-Type"), CONTENT_TYPE
+                        )
+                        self.assertEqual(
+                            json.loads(raw.decode("utf-8")), expected_body
+                        )
+                # 逆序不改变剩余为空即未命中的结论
+                status, _, raw = request(port, "GET", "/api/")
+                self.assertEqual(status, 404)
+                self.assertEqual(raw, NOT_FOUND_BODY)
+            finally:
+                server.stop()
+
+    def test_root_prefix_and_root_exact(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_root_prefix.json",
+                [
+                    # 根前缀覆盖任意非空剩余
+                    {"method": "GET", "path": "/", "pathMode": "prefix",
+                     "body": {"root_prefix": 1}},
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": {"v": 1}},
+                    # exact 规则即使存在根前缀候选也优先
+                    {"method": "GET", "path": "/exact",
+                     "body": {"exact": 1}},
+                ],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                def check(label, target, status, body=None):
+                    code, headers, raw = request(port, "GET", target)
+                    self.assertEqual(
+                        code, status,
+                        f"样例 {label} GET {target}: 期望 {status}，"
+                        f"实际 {code}；{raw!r}",
+                    )
+                    self.assertEqual(
+                        headers.get("Content-Type"), CONTENT_TYPE
+                    )
+                    if body is not None:
+                        self.assertEqual(json.loads(raw.decode("utf-8")), body)
+
+                # 根路径本身剩余为空，根前缀不覆盖
+                check("GET / 剩余为空", "/", 404)
+                # 根前缀覆盖任意多级剩余（查询串忽略）
+                check("GET /anything", "/anything", 200, {"root_prefix": 1})
+                check("GET /a/b/c?x=1", "/a/b/c?x=1", 200,
+                      {"root_prefix": 1})
+                # 更长的前缀优先于根前缀
+                check("GET /api/x 最长前缀", "/api/x", 200, {"v": 1})
+                # /api/ 对 /api/ 前缀剩余为空，但对根前缀剩余 "api/" 非空
+                check("GET /api/ 回退根前缀", "/api/", 200,
+                      {"root_prefix": 1})
+                # exact 完整相等优先于根前缀
+                check("GET /exact exact 优先", "/exact", 200, {"exact": 1})
+            finally:
+                server.stop()
+
+    def test_method_not_supported_does_not_use_prefix_route(self):
+        # PUT 等不支持方法：即使前缀能覆盖该路径也走统一 501，
+        # 不使用前缀路由的 body/status/delayMs
+        status, headers, raw, elapsed = timed_request(
+            self.port, "PUT", "/slow/x?y=1"
+        )
+        self.assertEqual(status, 501)
+        self.assertEqual(headers.get("Connection"), "close")
+        self.assertEqual(raw, METHOD_REJECT_BODY)
+        self.assertNotIn(b"demo_failure", raw)
+        self.assertLess(
+            elapsed, NO_DELAY_MAX_SECONDS,
+            f"PUT /slow/x: 501 不应应用前缀路由的 {DELAY_MS}ms 延迟，"
+            f"实际 {elapsed * 1000:.1f}ms",
+        )
+
+    def test_literal_path_comparison(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_prefix_literal.json",
+                [
+                    {"method": "GET", "path": "/Static/", "pathMode": "prefix",
+                     "body": {"v": "capital"}},
+                    {"method": "GET", "path": "/static/", "pathMode": "prefix",
+                     "body": {"v": "lower"}},
+                    {"method": "GET", "path": "/enc/", "pathMode": "prefix",
+                     "body": {"v": "enc"}},
+                    # 星号只是普通字符，不是通配符
+                    {"method": "GET", "path": "/wild/*/", "pathMode": "prefix",
+                     "body": {"v": "star"}},
+                ],
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                def check(label, target, status, body=None):
+                    code, headers, raw = request(port, "GET", target)
+                    self.assertEqual(
+                        code, status,
+                        f"样例 {label} GET {target}: 期望 {status}，"
+                        f"实际 {code}；{raw!r}",
+                    )
+                    self.assertEqual(
+                        headers.get("Content-Type"), CONTENT_TYPE
+                    )
+                    if body is not None:
+                        self.assertEqual(json.loads(raw.decode("utf-8")), body)
+
+                # 大小写敏感
+                check("大写前缀", "/Static/x", 200, {"v": "capital"})
+                check("小写前缀", "/static/x", 200, {"v": "lower"})
+                check("大小写不符", "/STATIC/x", 404)
+                # 尾部斜杠不合并：目录本身剩余为空
+                check("/Static/ 剩余为空", "/Static/", 404)
+                check("/Static 缺少尾斜杠", "/Static", 404)
+                # 百分号转义不解码：%2F 是字面三个字符，不能跨过分段
+                check("/enc/%61 字面匹配", "/enc/%61", 200, {"v": "enc"})
+                check("/enc%2Fa 不解码为 /enc/a", "/enc%2Fa", 404)
+                # 星号没有特殊含义
+                check("字面星号请求", "/wild/*/x", 200, {"v": "star"})
+                check("星号不当通配符", "/wild/a/x", 404)
+            finally:
+                server.stop()
+
+    def test_prefix_route_uses_configured_status_and_delay(self):
+        # 命中前缀路由后：沿用配置的 503 与 200ms 延迟
+        status, headers, raw, elapsed = timed_request(
+            self.port, "GET", "/slow/x?z=1"
+        )
+        self.assertGreaterEqual(
+            elapsed, DELAY_MIN_SECONDS,
+            f"前缀路由命中后应等待 {DELAY_MS}ms，实际 "
+            f"{elapsed * 1000:.1f}ms",
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+        self.assertEqual(
+            json.loads(raw.decode("utf-8")), {"error": "demo_failure"}
+        )
+        # 剩余为空不算命中：不等待、返回统一 404
+        status, _, raw, elapsed = timed_request(self.port, "GET", "/slow/")
+        self.assertEqual(status, 404)
+        self.assertEqual(raw, NOT_FOUND_BODY)
+        self.assertLess(
+            elapsed, NO_DELAY_MAX_SECONDS,
+            f"未命中不应应用延迟，实际 {elapsed * 1000:.1f}ms",
+        )
+
+
+# POST 前缀路由的 requestBody 校验回归：
+#   POST prefix /api/    样例 {"v":1}，配置正文 {"posted":1}
+#   GET  prefix /api/    同路径不同方法，配置正文 {"get":1}
+#   POST prefix /        无样例，配置正文 {"root":1}（用于验证校验失败
+#                        不会回退到其他候选）
+#   POST exact  /api/exact  样例 {"v":9}，503 + {"exact":1}
+PREFIX_BODY_RULES = [
+    {"method": "POST", "path": "/api/", "pathMode": "prefix",
+     "requestBody": {"v": 1}, "body": {"posted": 1}},
+    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+     "body": {"get": 1}},
+    {"method": "POST", "path": "/", "pathMode": "prefix",
+     "body": {"root": 1}},
+    {"method": "POST", "path": "/api/exact", "requestBody": {"v": 9},
+     "status": 503, "body": {"exact": 1}},
+]
+
+
+class PrefixRequestBodyTests(unittest.TestCase):
+    """路由选定后才校验 requestBody：失败返回 400，不尝试其他候选。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_prefix_body.json", PREFIX_BODY_RULES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def test_matching_body_returns_prefix_response(self):
+        for label, raw_body in [
+            ("与样例相等", b'{"v":1}'),
+            ("1 与 1.0 数值相等", b'{"v":1.0}'),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/api/x", body=raw_body
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(raw, b'{"posted":1}')
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_mismatching_body_returns_400_without_fallback(self):
+        # /api/x 同时可被 POST 前缀 /api/ 与根前缀 / 覆盖：选中更长的
+        # /api/ 后正文不匹配，必须 400，不得回退到根前缀返回 {"root":1}
+        for label, raw_body in [
+            ("被约束值不等", b'{"v":2}'),
+            ("空正文", b""),
+            ("JSON 语法错误", b"{"),
+            ("非法 UTF-8", b"\xff"),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/api/x", body=raw_body
+                )
+                self.assertEqual(status, 400, f"样例 {label}: {raw!r}")
+                self.assertEqual(
+                    headers.get("Content-Type"), CONTENT_TYPE
+                )
+                self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+
+    def test_empty_remainder_falls_through_to_root_prefix(self):
+        # POST /api/ 对前缀 /api/ 剩余为空（非候选），但对根前缀剩余非空，
+        # 根前缀无样例：忽略正文并返回其配置响应
+        status, headers, raw = request(
+            self.port, "POST", "/api/", body=b"not json"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, b'{"root":1}')
+
+    def test_exact_route_validated_with_its_own_sample(self):
+        # exact /api/exact 优先于前缀 /api/：
+        # 正文满足 exact 样例 {"v":9} 时返回 exact 的 503（前缀样例不会拦截）
+        status, headers, raw = request(
+            self.port, "POST", "/api/exact", body=b'{"v":9}'
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(raw, b'{"exact":1}')
+        # 正文只满足前缀样例 {"v":1}：exact 先被选中并按它自己的样例校验，
+        # 失败即 400，不得以前缀命中放行
+        status, headers, raw = request(
+            self.port, "POST", "/api/exact", body=b'{"v":1}'
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+
+    def test_same_prefix_path_distinct_by_method(self):
+        status, headers, raw = request(self.port, "GET", "/api/x")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, b'{"get":1}')
+
+
+# pathMode 规则加载校验：取值必须是区分大小写的 "exact"/"prefix"，且
+# prefix 的 path 必须以 / 结尾；否则 load_rules 抛 RulesError，CLI 退出
+# 码 2 且不监听
+INVALID_PATH_MODE_CASES = [
+    # (说明, pathMode 的 JSON 值)
+    ("大写 PREFIX", "PREFIX"),
+    ("首字母大写 Prefix", "Prefix"),
+    ("首字母大写 Exact", "Exact"),
+    ("带尾随空白", "prefix "),
+    ("空字符串", ""),
+    ("null", None),
+    ("布尔 true", True),
+    ("整数 1", 1),
+    ("浮点数 1.0", 1.0),
+    ("数组", ["prefix"]),
+    ("对象", {"mode": "prefix"}),
+]
+
+# prefix 模式下未以 / 结尾的 path
+PREFIX_MISSING_SLASH_CASES = [
+    # (说明, method, path)
+    ("缺少尾斜杠的目录", "GET", "/api"),
+    ("多段路径缺少尾斜杠", "GET", "/api/v1"),
+    ("单段路径缺少尾斜杠", "POST", "/x"),
+]
+
+
+class PathModeRulesValidationTests(unittest.TestCase):
+    """pathMode 取值与 prefix 尾斜杠校验：load_rules 与 CLI 两条入口。"""
+
+    def _items(self, bad_item, bad_index):
+        if bad_index == 0:
+            return [bad_item]
+        return [
+            {"method": "GET", "path": "/ok", "body": {"fine": 1}},
+            bad_item,
+        ]
+
+    def test_load_rules_rejects_invalid_path_mode(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            seq = 0
+            for label, bad_mode in INVALID_PATH_MODE_CASES:
+                for bad_index in (0, 1):
+                    with self.subTest(样例=label, 位置=f"routes[{bad_index}]"):
+                        bad_item = {
+                            "method": "GET", "path": "/api/",
+                            "pathMode": bad_mode, "body": {},
+                        }
+                        rules_path = write_rules(
+                            tmp, f"rules_bad_pathmode_{seq}.json",
+                            self._items(bad_item, bad_index),
+                        )
+                        seq += 1
+                        with self.assertRaises(RulesError) as ctx:
+                            load_rules(rules_path)
+                        message = str(ctx.exception)
+                        self.assertIn(
+                            f"routes[{bad_index}].pathMode", message,
+                            f"样例 {label}: 错误应标明 "
+                            f"routes[{bad_index}].pathMode，实际 {message!r}",
+                        )
+
+    def test_cli_rejects_invalid_path_mode_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            seq = 0
+            for label, bad_mode in INVALID_PATH_MODE_CASES:
+                for bad_index in (0, 1):
+                    with self.subTest(样例=label, 位置=f"routes[{bad_index}]"):
+                        bad_item = {
+                            "method": "GET", "path": "/api/",
+                            "pathMode": bad_mode, "body": {},
+                        }
+                        rules_path = write_rules(
+                            tmp, f"rules_bad_pathmode_cli_{seq}.json",
+                            self._items(bad_item, bad_index),
+                        )
+                        seq += 1
+                        returncode, stdout, stderr = start_and_wait_exit(
+                            rules_path, free_port()
+                        )
+                        self.assertEqual(
+                            returncode, 2,
+                            f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                            f"stdout={stdout!r} stderr={stderr!r}",
+                        )
+                        self.assertIn(
+                            f"routes[{bad_index}].pathMode", stderr,
+                            f"样例 {label}: 标准错误应包含路由位置与出错字段"
+                            f" pathMode，实际 stderr={stderr!r}",
+                        )
+                        self.assertNotIn("Traceback", stderr)
+                        self.assertNotIn(STARTUP_MARKER, stdout)
+
+    def test_load_rules_rejects_prefix_path_without_trailing_slash(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, method, bad_path) in enumerate(
+                PREFIX_MISSING_SLASH_CASES
+            ):
+                for bad_index in (0, 1):
+                    with self.subTest(
+                        样例=label, 位置=f"routes[{bad_index}]"
+                    ):
+                        bad_item = {
+                            "method": method, "path": bad_path,
+                            "pathMode": "prefix", "body": {},
+                        }
+                        rules_path = write_rules(
+                            tmp, f"rules_prefix_slash_{index}_{bad_index}.json",
+                            self._items(bad_item, bad_index),
+                        )
+                        with self.assertRaises(RulesError) as ctx:
+                            load_rules(rules_path)
+                        message = str(ctx.exception)
+                        self.assertIn(
+                            f"routes[{bad_index}]", message,
+                            f"样例 {label}: 错误应标明 routes[{bad_index}]，"
+                            f"实际 {message!r}",
+                        )
+                        self.assertIn(
+                            "pathMode", message,
+                            f"样例 {label}: 错误应包含出错字段 pathMode，"
+                            f"实际 {message!r}",
+                        )
+                        self.assertIn(
+                            bad_path, message,
+                            f"样例 {label}: 错误应标明实际 path {bad_path!r}，"
+                            f"实际 {message!r}",
+                        )
+
+    def test_cli_rejects_prefix_without_trailing_slash_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, method, bad_path) in enumerate(
+                PREFIX_MISSING_SLASH_CASES
+            ):
+                bad_item = {
+                    "method": method, "path": bad_path,
+                    "pathMode": "prefix", "body": {},
+                }
+                rules_path = write_rules(
+                    tmp, f"rules_prefix_slash_cli_{index}.json", [bad_item]
+                )
+                returncode, stdout, stderr = start_and_wait_exit(
+                    rules_path, free_port()
+                )
+                self.assertEqual(
+                    returncode, 2,
+                    f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                    f"stdout={stdout!r} stderr={stderr!r}",
+                )
+                self.assertIn("routes[0]", stderr)
+                self.assertIn("pathMode", stderr)
+                self.assertIn(bad_path, stderr)
+                self.assertNotIn("Traceback", stderr)
+                self.assertNotIn(STARTUP_MARKER, stdout)
+
+
+class PathModeValidLoadingTests(unittest.TestCase):
+    """合法对照：省略/显式 exact、prefix 尾斜杠与根路径均正常加载。"""
+
+    def test_path_modes_recorded_for_every_route(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_pathmodes_ok.json",
+                [
+                    {"method": "GET", "path": "/omit", "body": {}},
+                    {"method": "GET", "path": "/exact",
+                     "pathMode": "exact", "body": {}},
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": {}},
+                    {"method": "GET", "path": "/", "pathMode": "prefix",
+                     "body": {}},
+                    # exact 路径不需要以 / 结尾
+                    {"method": "POST", "path": "/api", "pathMode": "exact",
+                     "body": {}},
+                ],
+            )
+            routes = load_rules(rules_path)
+            self.assertEqual(
+                routes.path_modes[("GET", "/omit")], "exact"
+            )
+            self.assertEqual(
+                routes.path_modes[("GET", "/exact")], "exact"
+            )
+            self.assertEqual(
+                routes.path_modes[("GET", "/api/")], "prefix"
+            )
+            self.assertEqual(
+                routes.path_modes[("GET", "/")], "prefix"
+            )
+            self.assertEqual(
+                routes.path_modes[("POST", "/api")], "exact"
+            )
+            # path_modes 的键集合与路由本身一致
+            self.assertEqual(set(routes.path_modes), set(routes))
+
+
+class PathModeDuplicateTests(unittest.TestCase):
+    """同一 method+path 仍禁止重复，不能靠 pathMode 区分。"""
+
+    def test_duplicate_same_method_and_path_rejected(self):
+        from mock_server import RulesError, load_rules
+
+        cases = [
+            (
+                "先 prefix 后 exact",
+                [
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": 1},
+                    {"method": "GET", "path": "/api/", "body": 2},
+                ],
+            ),
+            (
+                "两条都是 prefix",
+                [
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": 1},
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": 2},
+                ],
+            ),
+            (
+                "先 exact 后 prefix",
+                [
+                    {"method": "GET", "path": "/api/", "body": 1},
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": 2},
+                ],
+            ),
+        ]
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, items) in enumerate(cases):
+                with self.subTest(样例=label):
+                    rules_path = write_rules(
+                        tmp, f"rules_pathmode_dup_{index}.json", items
+                    )
+                    with self.assertRaises(RulesError) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    self.assertIn("duplicate route", message)
+                    self.assertIn("routes[1]", message)
+                    self.assertIn("GET /api/", message)
+
+    def test_same_path_different_methods_or_paths_still_load(self):
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp,
+                "rules_pathmode_distinct.json",
+                [
+                    # 同路径不同方法（且模式不同）是两条路由
+                    {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                     "body": {"m": "GET"}},
+                    {"method": "POST", "path": "/api/", "body": {"m": "POST"}},
+                    # /api（exact）与 /api/（prefix）路径不同，可以共存
+                    {"method": "GET", "path": "/api", "body": {"m": "dir"}},
+                ],
+            )
+            routes = load_rules(rules_path)
+            self.assertEqual(len(routes), 3)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                status, _, raw = request(port, "GET", "/api/x")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"m": "GET"})
+                status, _, raw = request(port, "GET", "/api")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"m": "dir"})
+                # GET /api/ 对 GET 前缀剩余为空，未命中
+                status, _, raw = request(port, "GET", "/api/")
+                self.assertEqual(status, 404)
+                status, _, raw = request(port, "POST", "/api/")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"m": "POST"})
+            finally:
+                server.stop()
+
+
+class PathModeBackwardCompatibilityTests(unittest.TestCase):
+    """旧规则无需补字段：自带 rules.json 全部按 exact 加载并正常服务。"""
+
+    def test_shipped_rules_load_as_exact_and_serve(self):
+        from mock_server import load_rules
+
+        rules_path = PROJECT_ROOT / "rules.json"
+        routes = load_rules(rules_path)
+        self.assertTrue(routes)
+        self.assertTrue(
+            all(mode == "exact" for mode in routes.path_modes.values())
+        )
+        port = free_port()
+        server = ServerProcess(rules_path, port)
+        try:
+            status, headers, raw = request(port, "GET", "/hello?x=1")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")), {"message": "你好"}
+            )
+        finally:
+            server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
