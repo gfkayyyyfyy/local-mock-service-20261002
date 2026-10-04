@@ -86,12 +86,17 @@ def _ensure_finite_numbers(data):
                 stack.append((value[index], f"{location}[{index}]"))
 
 
-def _json_equal(expected, actual):
-    """递归比较两个由 json 解析得到的值。
+def _json_matches(expected, actual, allow_extra_keys):
+    """exact 与 subset 共用的递归比较流程。
 
-    对象须有完全相同的键集合（键序与排版空白不影响结果）；数组长度与
-    逐元素顺序参与比较；字符串区分大小写；数字按数值比较（1 与 1.0 相等）；
-    True/False 与 0/1 不等；None 只等于 None；类型不同即不相等。
+    标量、数组与嵌套值的语义两种模式一致：数组长度与逐元素顺序参与
+    比较（不接受前缀匹配）；字符串区分大小写；数字按数值比较（1 与
+    1.0 相等）；True/False 与 0/1 不等；None 只等于 None；类型不同
+    即不匹配。唯一差异在对象的键集合：allow_extra_keys 为 False
+    （exact）时要求键集合完全相同（键序与排版空白不影响结果），为
+    True（subset）时只要求样例的键全部存在于实际对象中、对应值递归
+    按同一流程比较，实际对象允许额外键（空对象样例因此匹配任意对象，
+    但也只匹配对象）。
     """
     stack = [(expected, actual)]
     while stack:
@@ -122,7 +127,13 @@ def _json_equal(expected, actual):
                 stack.append((want[index], got[index]))
             continue
         if isinstance(want, dict):
-            if type(got) is not dict or set(want) != set(got):
+            if type(got) is not dict:
+                return False
+            # 两种模式唯一的差异：exact 要求键集合相同，subset 允许额外键
+            if allow_extra_keys:
+                if not set(want) <= set(got):
+                    return False
+            elif set(want) != set(got):
                 return False
             for key in want:
                 stack.append((want[key], got[key]))
@@ -131,6 +142,14 @@ def _json_equal(expected, actual):
         if want != got:
             return False
     return True
+
+
+def _json_equal(expected, actual):
+    """整体相等比较：对象须有完全相同的键集合，其余语义与 _json_matches
+    一致（数组长度与顺序参与比较、字符串区分大小写、数字按数值比较、
+    布尔与数字互不相等、None 只等于 None、类型不同即不相等）。
+    """
+    return _json_matches(expected, actual, allow_extra_keys=False)
 
 
 def _json_subset(expected, actual):
@@ -141,44 +160,7 @@ def _json_subset(expected, actual):
     语义一致：数字按数值比较（1 与 1.0 相等）、布尔与数字不等、字符串
     区分大小写、None 只匹配 None、类型不符即不匹配。
     """
-    stack = [(expected, actual)]
-    while stack:
-        want, got = stack.pop()
-        if want is None or got is None:
-            if want is not got:
-                return False
-            continue
-        # bool 是 int 的子类，须在数字比较之前显式区分
-        if isinstance(want, bool) or isinstance(got, bool):
-            if type(want) is not type(got) or want != got:
-                return False
-            continue
-        if isinstance(want, (int, float)):
-            if not isinstance(got, (int, float)) or isinstance(got, bool):
-                return False
-            if want != got:
-                return False
-            continue
-        if isinstance(want, str):
-            if type(got) is not str or want != got:
-                return False
-            continue
-        if isinstance(want, list):
-            if type(got) is not list or len(want) != len(got):
-                return False
-            for index in range(len(want) - 1, -1, -1):
-                stack.append((want[index], got[index]))
-            continue
-        if isinstance(want, dict):
-            if type(got) is not dict or not set(want) <= set(got):
-                return False
-            for key in want:
-                stack.append((want[key], got[key]))
-            continue
-        # json 解析结果只会是 None/bool/int/float/str/list/dict
-        if want != got:
-            return False
-    return True
+    return _json_matches(expected, actual, allow_extra_keys=True)
 
 
 def load_rules(path):

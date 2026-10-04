@@ -3889,5 +3889,257 @@ class RequestBodyModeRemovalTests(unittest.TestCase):
                 exact_server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 请求体比较流程重构回归
+#
+# exact 与 subset 的比较流程已合并为共享实现（标量、数组与嵌套值只维护
+# 一份），_json_equal 与 _json_subset 保留原有的两参数调用方式与布尔
+# 返回值。下列用例按任务验收场景锁定两种模式的差异与共同语义：
+#   POST /exact  样例 {"user":{"id":1}}，省略模式字段（等同 exact），
+#                503 + {"accepted":true}，不设置延迟
+#   POST /subset 同样样例与响应，requestBodyMode 为 "subset"
+#   POST /exact_list / /subset_list  样例 [1,{"k":"v"}]，锁定数组语义
+#   POST /exact_slow / /subset_slow  样例 {"v":1}，503 + 200ms 延迟，
+#                锁定匹配失败不采用配置状态、正文或延迟
+# ---------------------------------------------------------------------------
+COMPARISON_REFACTOR_RULES = [
+    {"method": "POST", "path": "/exact",
+     "requestBody": {"user": {"id": 1}},
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/subset", "requestBodyMode": "subset",
+     "requestBody": {"user": {"id": 1}},
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/exact_list",
+     "requestBody": [1, {"k": "v"}],
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/subset_list", "requestBodyMode": "subset",
+     "requestBody": [1, {"k": "v"}],
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/exact_slow",
+     "requestBody": {"v": 1}, "delayMs": DELAY_MS,
+     "status": 503, "body": {"error": "demo_failure"}},
+    {"method": "POST", "path": "/subset_slow", "requestBodyMode": "subset",
+     "requestBody": {"v": 1}, "delayMs": DELAY_MS,
+     "status": 503, "body": {"error": "demo_failure"}},
+]
+
+ACCEPTED_BODY = b'{"accepted":true}'
+
+
+class RequestBodyComparisonRefactorTests(unittest.TestCase):
+    """验收场景：/exact 与 /subset 同样样例 {"user":{"id":1}}、503、无延迟。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_comparison_refactor.json",
+            COMPARISON_REFACTOR_RULES,
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _assert_response(self, label, target, raw_body, expected_status,
+                         expected_raw):
+        status, headers, raw = request(
+            self.port, "POST", target, body=raw_body
+        )
+        self.assertEqual(
+            status, expected_status,
+            f"样例 {label}: 状态码应为 {expected_status}，实际 {status}；"
+            f"响应={raw!r}",
+        )
+        # UTF-8 JSON 响应类型与按字节计算的 Content-Length 保持原义
+        self.assertEqual(
+            headers.get("Content-Type"), CONTENT_TYPE,
+            f"样例 {label}: Content-Type 应为 {CONTENT_TYPE!r}",
+        )
+        self.assertEqual(
+            raw, expected_raw,
+            f"样例 {label}: 响应体应为 {expected_raw!r}，实际 {raw!r}",
+        )
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def _assert_400_mismatch(self, label, raw_body, target):
+        self._assert_response(
+            label, target, raw_body, 400, REQUEST_BODY_MISMATCH
+        )
+
+    def test_acceptance_extra_key_distinguishes_modes(self):
+        # 验收正文：id 写为 1.0（数值相等）、user 含额外键 name（中文）
+        body = '{"user":{"id":1.0,"name":"甲"}}'.encode("utf-8")
+        self._assert_400_mismatch(
+            "exact 拒绝额外键", body, "/exact"
+        )
+        self._assert_response(
+            "subset 允许额外键", "/subset", body, 503, ACCEPTED_BODY
+        )
+        # 删除 name 后两者均返回配置响应（1.0 与 1 数值相等）
+        body_without_name = b'{"user":{"id":1.0}}'
+        for target in ("/exact", "/subset"):
+            with self.subTest(路由=target):
+                self._assert_response(
+                    "删除额外键后放行", target, body_without_name,
+                    503, ACCEPTED_BODY,
+                )
+
+    def test_missing_sample_keys_rejected_in_both_modes(self):
+        for label, raw_body in [
+            ("缺少 user 键", b"{}"),
+            ("缺少嵌套 id 键", b'{"user":{}}'),
+            ("整体为 null", b"null"),
+            ("整体不是对象", b'[{"user":{"id":1}}]'),
+        ]:
+            for target in ("/exact", "/subset"):
+                with self.subTest(正文=label, 路由=target):
+                    self._assert_400_mismatch(label, raw_body, target)
+
+    def test_constrained_value_and_type_mismatch_rejected_in_both_modes(self):
+        for label, raw_body in [
+            ("被约束值不同", b'{"user":{"id":2}}'),
+            ("被约束值为字符串", b'{"user":{"id":"1"}}'),
+            ("布尔不等于数字", b'{"user":{"id":true}}'),
+            ("嵌套值类型不符", b'{"user":1}'),
+            ("嵌套值为 null", b'{"user":null}'),
+        ]:
+            for target in ("/exact", "/subset"):
+                with self.subTest(正文=label, 路由=target):
+                    self._assert_400_mismatch(label, raw_body, target)
+
+    def test_array_length_and_order_rejected_in_both_modes(self):
+        for target in ("/exact_list", "/subset_list"):
+            with self.subTest(路由=target, 正文="完全一致"):
+                self._assert_response(
+                    "完全一致", target, b'[1,{"k":"v"}]', 503, ACCEPTED_BODY
+                )
+            for label, raw_body in [
+                ("数组长度变短", b"[1]"),
+                ("数组长度变长", b'[1,{"k":"v"},2]'),
+                ("数组顺序改变", b'[{"k":"v"},1]'),
+                ("元素被约束值不同", b'[1,{"k":"V"}]'),
+                ("元素类型不符", b'[1,"k"]'),
+            ]:
+                with self.subTest(路由=target, 正文=label):
+                    self._assert_400_mismatch(label, raw_body, target)
+
+    def test_array_element_object_extra_keys_only_in_subset(self):
+        # 数组中的对象同样适用：subset 允许元素对象带额外键，exact 不允许
+        body = b'[1,{"k":"v","x":1}]'
+        self._assert_400_mismatch(
+            "exact 拒绝元素对象额外键", body, "/exact_list"
+        )
+        self._assert_response(
+            "subset 允许元素对象额外键", "/subset_list", body,
+            503, ACCEPTED_BODY,
+        )
+
+    def test_malformed_bodies_rejected_in_both_modes(self):
+        for label, raw_body in [
+            ("空正文", b""),
+            ("非法 UTF-8", b"\xff\xfe"),
+            ("JSON 语法错误", b'{"user":{"id":1}'),
+            ("非有限数字 1e400", b'{"user":{"id":1e400}}'),
+            ("非标准字面量 NaN", b"NaN"),
+        ]:
+            for target in ("/exact", "/subset"):
+                with self.subTest(正文=label, 路由=target):
+                    self._assert_400_mismatch(label, raw_body, target)
+
+    def test_subset_extra_fields_cannot_bypass_full_body_checks(self):
+        # subset 的额外字段仍须通过完整的 UTF-8、JSON 语法与非有限数字检查
+        for label, raw_body in [
+            ("额外字段含 NaN 字面量", b'{"user":{"id":1},"extra":NaN}'),
+            ("额外字段含溢出数字", b'{"user":{"id":1},"extra":1e400}'),
+            ("额外字段含非法 UTF-8", b'{"user":{"id":1},"extra":"\xff"}'),
+            ("合法前缀后语法错误", b'{"user":{"id":1},"extra":'),
+        ]:
+            with self.subTest(正文=label):
+                self._assert_400_mismatch(label, raw_body, "/subset")
+
+    def test_mismatch_ignores_configured_status_body_and_delay(self):
+        # 两种模式的慢路由：校验失败立即 400，不等待、不使用 503 与配置正文
+        for target in ("/exact_slow", "/subset_slow"):
+            with self.subTest(路由=target, 分支="不匹配"):
+                start = time.monotonic()
+                status, headers, raw = request(
+                    self.port, "POST", target, body=b'{"v":2}'
+                )
+                elapsed = time.monotonic() - start
+                self.assertEqual(status, 400)
+                self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+                self.assertLess(
+                    elapsed, NO_DELAY_MAX_SECONDS,
+                    f"{target} 不匹配时不应应用 {DELAY_MS}ms 延迟，"
+                    f"实际 {elapsed * 1000:.1f}ms",
+                )
+            with self.subTest(路由=target, 分支="匹配"):
+                # 校验通过才应用既有延迟并返回配置的状态与正文
+                status, headers, raw, elapsed = timed_request(
+                    self.port, "POST", target, body=b'{"v":1.0}'
+                )
+                self.assertGreaterEqual(
+                    elapsed, DELAY_MIN_SECONDS,
+                    f"{target} 匹配后应等待 {DELAY_MS}ms，"
+                    f"实际 {elapsed * 1000:.1f}ms",
+                )
+                self.assertEqual(status, 503)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")), {"error": "demo_failure"}
+                )
+
+
+class JsonComparisonHelperRefactorTests(unittest.TestCase):
+    """重构后 _json_equal/_json_subset 的调用方式与布尔返回值保持不变。"""
+
+    def test_helpers_keep_two_arg_call_and_bool_return(self):
+        from mock_server import _json_equal, _json_subset
+
+        sample = {"user": {"id": 1}}
+        cases = [
+            # (expected, actual, exact 结果, subset 结果)
+            (sample, {"user": {"id": 1.0}}, True, True),
+            (sample, {"user": {"id": 1.0, "name": "甲"}}, False, True),
+            (sample, {"user": {"id": 2}}, False, False),
+            (sample, {"user": {}}, False, False),
+            (sample, {"user": {"id": True}}, False, False),
+            ({"meta": {}}, {"meta": {"a": 1}}, False, True),
+            ({"meta": {}}, {"meta": []}, False, False),
+        ]
+        for expected, actual, exact_result, subset_result in cases:
+            with self.subTest(pair=(expected, actual)):
+                exact = _json_equal(expected, actual)
+                subset = _json_subset(expected, actual)
+                # 返回值必须是布尔，而非真值/假值的其他类型
+                self.assertIs(type(exact), bool)
+                self.assertIs(type(subset), bool)
+                self.assertEqual(exact, exact_result)
+                self.assertEqual(subset, subset_result)
+
+    def test_shared_engine_matches_both_modes(self):
+        # 共享比较流程：allow_extra_keys 分别对应 exact 与 subset 语义
+        from mock_server import _json_equal, _json_matches, _json_subset
+
+        pairs = [
+            ({"a": 1, "b": [True, "x"]}, {"b": [True, "x"], "a": 1.0}),
+            ({"a": 1}, {"a": 1, "b": 2}),
+            ([{"k": None}], [{"k": None, "j": 0}]),
+            ("Case", "case"),
+            (None, None),
+            (None, 0),
+        ]
+        for expected, actual in pairs:
+            with self.subTest(pair=(expected, actual)):
+                self.assertEqual(
+                    _json_matches(expected, actual, allow_extra_keys=False),
+                    _json_equal(expected, actual),
+                )
+                self.assertEqual(
+                    _json_matches(expected, actual, allow_extra_keys=True),
+                    _json_subset(expected, actual),
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
