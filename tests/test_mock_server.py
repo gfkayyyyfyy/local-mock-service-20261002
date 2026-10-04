@@ -484,20 +484,20 @@ class MockServerRegressionTests(unittest.TestCase):
 
 
 class StatusBoundaryTests(unittest.TestCase):
-    """合法 status 边界：200、400、599 均可加载并原样返回。"""
+    """合法 status：200、201、400、599 均可加载并原样返回。"""
 
     def test_boundary_statuses_load_and_return(self):
         with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
             routes = [
                 {"method": "GET", "path": f"/s{status}",
                  "status": status, "body": {"status": status}}
-                for status in (200, 400, 599)
+                for status in (200, 201, 400, 599)
             ]
             rules_path = write_rules(tmp, "rules_boundary.json", routes)
             port = free_port()
             server = ServerProcess(rules_path, port)
             try:
-                for status in (200, 400, 599):
+                for status in (200, 201, 400, 599):
                     with self.subTest(status=status):
                         code, headers, raw = request(
                             port, "GET", f"/s{status}"
@@ -517,16 +517,173 @@ class StatusBoundaryTests(unittest.TestCase):
                 server.stop()
 
 
+# 201 创建成功响应的专用规则：POST /items 要求正文 {"ok": true}，
+# 校验通过返回 201 与 {"id": 1}；另一条 GET 路由证明 GET 同样可配置 201
+CREATED_ROUTES = [
+    {"method": "POST", "path": "/items",
+     "requestBody": {"ok": True},
+     "status": 201, "body": {"id": 1}},
+    {"method": "GET", "path": "/created",
+     "status": 201, "body": {"id": 2}},
+]
+
+
+class Status201BehaviorTests(unittest.TestCase):
+    """status=201：GET 与 POST 均可配置；POST 仅在正文样例校验通过后
+    返回 201 与配置正文，校验失败仍返回 400 且不采用配置的状态、正文
+    或延迟。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_status_201.json", CREATED_ROUTES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def test_post_matching_body_returns_201_created(self):
+        # 任务约定场景：POST /items 正文 {"ok":true} -> 201 {"id":1}
+        status, headers, raw = request(
+            self.port, "POST", "/items", body=b'{"ok":true}'
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, b'{"id":1}')
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_get_route_can_also_be_configured_with_201(self):
+        status, headers, raw = request(self.port, "GET", "/created")
+        self.assertEqual(status, 201)
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, b'{"id":2}')
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_post_mismatching_body_still_returns_400(self):
+        # {"ok":false} 与样例不相等：400 固定错误正文，不采用配置的
+        # 201 与 {"id":1}
+        for label, raw_body in [
+            ("ok 为 false", b'{"ok":false}'),
+            ("缺少 ok 键", b'{}'),
+            ("ok 为数字 1", b'{"ok":1}'),
+            ("非法 JSON（孤立左花括号）", b"{"),
+            ("空正文", b""),
+            ("NaN 字面量", b'{"ok":NaN}'),
+            ("非法 UTF-8", b"\xff"),
+        ]:
+            with self.subTest(正文=label):
+                code, headers, resp_raw = request(
+                    self.port, "POST", "/items", body=raw_body
+                )
+                self.assertEqual(code, 400)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(resp_raw, REQUEST_BODY_MISMATCH)
+                self.assertEqual(
+                    int(headers["Content-Length"]), len(resp_raw)
+                )
+
+    def test_omitted_status_still_defaults_to_200(self):
+        # 省略 status 的行为不变：另起一份只有默认状态的规则快速核对
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            path = write_rules(
+                tmp,
+                "rules_status_default.json",
+                [{"method": "GET", "path": "/d", "body": {"ok": True}}],
+            )
+            port = free_port()
+            server = ServerProcess(path, port)
+            try:
+                status, _, raw = request(port, "GET", "/d")
+                self.assertEqual(status, 200)
+                self.assertEqual(raw, b'{"ok":true}')
+            finally:
+                server.stop()
+
+    def test_201_route_uses_template_and_delay_semantics(self):
+        # 201 路由沿用既有模板与延迟语义：模板只渲染最终选中的路由，
+        # 延迟只在正文读取完毕且样例校验通过后应用；响应不附加任何字段
+        delay_ms = 200
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            path = write_rules(
+                tmp,
+                "rules_status_201_delay.json",
+                [
+                    {"method": "POST", "path": "/items",
+                     "requestBody": {"ok": True},
+                     "status": 201, "delayMs": delay_ms,
+                     "bodyMode": "template",
+                     "body": {"id": 1, "made": "{{request.method}}"}},
+                ],
+            )
+            port = free_port()
+            server = ServerProcess(path, port)
+            try:
+                # 校验通过：等满延迟后返回 201 与渲染后的模板正文
+                status, headers, raw, elapsed = timed_request(
+                    port, "POST", "/items?x=1", body=b'{"ok":true}'
+                )
+                self.assertGreaterEqual(
+                    elapsed, delay_ms / 1000 - 0.02,
+                    f"201 路由校验通过后仍应等待 {delay_ms}ms，实际 "
+                    f"{elapsed * 1000:.1f}ms",
+                )
+                self.assertEqual(status, 201)
+                self.assertEqual(raw, b'{"id":1,"made":"POST"}')
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                # 校验失败：立即 400，不等待、不使用 201 或模板正文
+                start = time.monotonic()
+                status, headers, raw = request(
+                    port, "POST", "/items", body=b'{"ok":false}'
+                )
+                failed_elapsed = time.monotonic() - start
+                self.assertLess(
+                    failed_elapsed, delay_ms / 1000 - 0.05,
+                    "正文校验失败时不应应用延迟，实际 "
+                    f"{failed_elapsed * 1000:.1f}ms",
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+            finally:
+                server.stop()
+
+    def test_check_rules_accepts_single_201_route(self):
+        # 现有 --check-rules 入口检查任务中的 create.json 形态：
+        # 只输出一行 mock_server rules valid (1 route(s))，退出码 0，
+        # 不监听或探测端口
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            path = write_rules(
+                tmp, "create.json", [CREATED_ROUTES[0]]
+            )
+            with occupied_local_port() as occupied:
+                returncode, stdout, stderr, elapsed = run_check_rules(
+                    path, port=occupied.port
+                )
+            self.assertEqual(
+                returncode, 0,
+                f"含 201 路由的规则应通过检查，实际退出码 {returncode}；"
+                f"stdout={stdout!r} stderr={stderr!r}",
+            )
+            self.assertEqual(stdout, "mock_server rules valid (1 route(s))\n")
+            self.assertEqual(stderr, "")
+            self.assertLess(elapsed, CHECK_RULES_NO_WAIT_MAX_SECONDS)
+
+
 INVALID_STATUSES = [
     ("整数 199（低于下限）", 199),
-    ("整数 201（2xx 仅接受 200）", 201),
+    ("整数 202（2xx 仅接受 200 与 201）", 202),
+    ("整数 204（2xx 仅接受 200 与 201）", 204),
+    ("整数 300（3xx 不接受）", 300),
     ("整数 399（3xx 不接受）", 399),
     ("整数 600（高于上限）", 600),
     ("布尔 true", True),
     ("布尔 false", False),
     ("null", None),
     ('字符串 "503"', "503"),
+    ('字符串 "201"', "201"),
     ("浮点数 503.0", 503.0),
+    ("浮点数 201.0", 201.0),
     ("空数组 []", []),
     ("空对象 {}", {}),
 ]
