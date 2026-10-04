@@ -5622,5 +5622,115 @@ class InvalidBodyModeTests(unittest.TestCase):
                     )
 
 
+# ---------------------------------------------------------------------------
+# 正文校验 + 模板渲染 + 路由延迟组合回归
+#
+# 一条带 requestBody 的延迟模板 POST 路由：正文校验通过才进入既有流程
+# （读完正文后先等待 delayMs，再按本次请求渲染模板并返回配置状态）；
+# 校验失败立即返回 400 与 request_body_mismatch，不采用配置的状态、
+# 模板正文或延迟。计时口径与 DelayBehaviorTests 一致：从发送请求前量到
+# 响应状态行与响应头接收完毕。
+# ---------------------------------------------------------------------------
+
+
+class DelayedTemplateCheckedRouteTests(unittest.TestCase):
+    """同一连接上先后验证：校验通过走延迟模板响应，校验失败立即 400。"""
+
+    ROUTE = {
+        "method": "POST",
+        "path": "/checked",
+        "requestBody": {"ok": True},
+        "bodyMode": "template",
+        "status": 503,
+        "delayMs": DELAY_MS,
+        "body": {
+            "text": "你好 {{request.method}} {{request.path}}?{{request.query}}"
+        },
+    }
+
+    @staticmethod
+    def _timed_post(conn, target, body):
+        """在既有连接上发 POST，返回 (状态码, 响应头, 响应体字节, 到响应头的耗时)。"""
+        start = time.monotonic()
+        conn.request("POST", target, body=body)
+        resp = conn.getresponse()
+        elapsed = time.monotonic() - start
+        raw = resp.read()
+        headers = {k: v for k, v in resp.getheaders()}
+        return resp.status, headers, raw, elapsed
+
+    def _assert_json_response(self, label, headers, raw, expected_body):
+        content_type = headers.get("Content-Type")
+        self.assertEqual(
+            content_type, CONTENT_TYPE,
+            f"{label}: Content-Type 应为 {CONTENT_TYPE!r}，实际 {content_type!r}",
+        )
+        content_length = headers.get("Content-Length")
+        self.assertIsNotNone(content_length, f"{label}: 缺少 Content-Length")
+        self.assertEqual(
+            int(content_length), len(raw),
+            f"{label}: Content-Length={content_length} "
+            f"与实际响应体字节数 {len(raw)} 不符",
+        )
+        # 中文内容必须能按 UTF-8 正确解析，且 JSON 值符合预期
+        actual_body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(
+            actual_body, expected_body,
+            f"{label}: 响应 JSON 应为 {expected_body}，实际 {actual_body}",
+        )
+
+    def test_body_validation_gates_delay_and_template_response(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_checked.json", [self.ROUTE])
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                conn = HTTPConnection(
+                    "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+                )
+                try:
+                    # 第一次：正文与样例一致；查询串含加号、空值、无等号
+                    # 片段与百分号转义，应原样进入模板渲染
+                    ok = self._timed_post(
+                        conn, "/checked?tag=a+z&tag=&flag&x=%2f",
+                        b'{"ok":true}',
+                    )
+                    # 读完响应后在同一连接上再发：正文不匹配样例
+                    bad = self._timed_post(
+                        conn, "/checked?x=other", b'{"ok":false}',
+                    )
+                finally:
+                    conn.close()
+
+                # 校验通过：先等待 delayMs 再开始响应，随后返回配置的
+                # 503 与按本次请求渲染的模板正文（查询串保持原样）
+                status, headers, raw, elapsed = ok
+                self.assertGreaterEqual(
+                    elapsed, DELAY_MIN_SECONDS,
+                    f"校验通过：响应开始应不早于 {DELAY_MS}ms，"
+                    f"实际 {elapsed * 1000:.1f}ms",
+                )
+                self.assertEqual(status, 503)
+                self._assert_json_response(
+                    "校验通过", headers, raw,
+                    {"text": "你好 POST /checked?tag=a+z&tag=&flag&x=%2f"},
+                )
+
+                # 校验失败：立即返回 400，不采用配置的 503、模板正文或延迟
+                status, headers, raw, elapsed = bad
+                self.assertLess(
+                    elapsed, NO_DELAY_MAX_SECONDS,
+                    f"校验失败：不应等待配置的 {DELAY_MS}ms，"
+                    f"实际 {elapsed * 1000:.1f}ms",
+                )
+                self.assertEqual(status, 400)
+                self._assert_json_response(
+                    "校验失败", headers, raw,
+                    {"error": "request_body_mismatch"},
+                )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
