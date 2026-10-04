@@ -3889,5 +3889,330 @@ class RequestBodyModeRemovalTests(unittest.TestCase):
                 exact_server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 请求体比较流程重构（exact/subset 共享标量、数组与嵌套值比较）验收回归
+#
+# 两条 POST 路由使用完全相同的样例 {"user":{"id":1}}、状态 503 与配置正文
+# {"accepted":true}，均不设置延迟，仅 requestBodyMode 不同。下列用例固定：
+# 额外键在 exact 下 400、subset 下放行，删除额外键后两者都放行；缺键、
+# 被约束值不等、类型不符在两种模式下都 400；空正文、非法 UTF-8、JSON
+# 语法错误、非有限数字同样 400，subset 的额外字段不能绕过完整正文检查；
+# 失败不采用配置的状态、正文或延迟；查询字符串忽略、未命中 404、其他
+# 方法 501 均保持原行为。
+# ---------------------------------------------------------------------------
+
+ACCEPTANCE_ROUTES = [
+    {"method": "POST", "path": "/exact",
+     "requestBody": {"user": {"id": 1}},
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/subset", "requestBodyMode": "subset",
+     "requestBody": {"user": {"id": 1}},
+     "status": 503, "body": {"accepted": True}},
+]
+ACCEPTED_BODY = b'{"accepted":true}'
+
+# 两种模式下都应判为不匹配的、本身为合法 JSON 的正文
+ACCEPTANCE_MISMATCH_CASES = [
+    ("缺少 user 键", b"{}"),
+    ("缺少嵌套 id 键", b'{"user":{}}'),
+    ("被约束值不同（id=2）", b'{"user":{"id":2}}'),
+    ("id 为字符串（类型不符）", b'{"user":{"id":"1"}}'),
+    ("id 为布尔（布尔不等于数字）", b'{"user":{"id":true}}'),
+    ("id 为 null（null 只匹配 null）", b'{"user":{"id":null}}'),
+    ("user 不是对象", b'{"user":1}'),
+    ("user 为 null", b'{"user":null}'),
+    ("整体写成数组", b'[{"user":{"id":1}}]'),
+    ("整体为 null", b"null"),
+]
+
+ACCEPTANCE_MALFORMED_CASES = [
+    ("空正文", b""),
+    ("非法 UTF-8", b"\xff\xfe"),
+    ("JSON 语法错误：孤立左花括号", b"{"),
+    ("JSON 语法错误：尾随逗号", b'{"user":{"id":1},}'),
+    ("JSON 语法错误：裸文本", b"not json"),
+    ("NaN 字面量", b'{"user":{"id":NaN}}'),
+    ("Infinity 字面量", b'{"user":{"id":Infinity}}'),
+    ("溢出数字 1e400", b'{"user":{"id":1e400}}'),
+]
+
+# subset 的额外字段也不得绕过完整正文检查
+SUBSET_EXTRA_FIELD_BAD_CASES = [
+    ("顶层额外字段为 NaN", b'{"user":{"id":1},"extra":NaN}'),
+    ("顶层额外字段溢出为 inf", b'{"user":{"id":1},"extra":1e400}'),
+    ("嵌套额外字段为 NaN", b'{"user":{"id":1,"name":NaN}}'),
+    ("额外字段中的数字语法错误", b'{"user":{"id":1},"extra":1e}'),
+]
+
+
+class RequestBodyComparisonModesTests(unittest.TestCase):
+    """/exact 与 /subset：同样例、同 503 配置响应、无延迟，仅模式不同。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_compare_modes.json", ACCEPTANCE_ROUTES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def _assert_configured_503(self, label, target, raw_body):
+        status, headers, raw = request(
+            self.port, "POST", target, body=raw_body
+        )
+        self.assertEqual(
+            status, 503,
+            f"样例 {label}: 应返回配置的 503，实际 {status}；响应={raw!r}",
+        )
+        self.assertEqual(
+            headers.get("Content-Type"), CONTENT_TYPE,
+            f"样例 {label}: Content-Type 应为 {CONTENT_TYPE!r}",
+        )
+        self.assertEqual(raw, ACCEPTED_BODY, f"样例 {label}: 响应体应为配置正文")
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def _assert_400_mismatch(self, label, target, raw_body):
+        status, headers, raw = request(
+            self.port, "POST", target, body=raw_body
+        )
+        self.assertEqual(
+            status, 400,
+            f"样例 {label} @ {target}: 应返回 400，实际 {status}；"
+            f"响应={raw!r}",
+        )
+        self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+        self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_matching_bodies_return_503_in_both_modes(self):
+        # 样例 {"user":{"id":1}} 的等价写法：1 与 1.0 数值相等、键序与
+        # 排版空白不影响；两条路由均不设延迟，成功也应立即响应
+        matching = [
+            ("紧凑原样", b'{"user":{"id":1}}'),
+            ("id 写为 1.0", b'{"user":{"id":1.0}}'),
+            ("多余空白", b'  { "user" : { "id" : 1.0 } }  '),
+        ]
+        for target in ("/exact", "/subset"):
+            for label, raw_body in matching:
+                with self.subTest(路由=target, 正文=label):
+                    start = time.monotonic()
+                    self._assert_configured_503(label, target, raw_body)
+                    elapsed = time.monotonic() - start
+                    self.assertLess(
+                        elapsed, NO_DELAY_MAX_SECONDS,
+                        f"{target} {label}: 未配置延迟，不应人为等待，"
+                        f"实际 {elapsed * 1000:.1f}ms",
+                    )
+
+    def test_extra_key_body_exact_400_subset_503(self):
+        # 任务验收正文：id 写为 1.0、user 下有额外键 name（含中文）。
+        # exact 要求键集合相同 -> 400；subset 允许额外键 -> 503 配置正文
+        acceptance_body = '{"user":{"id":1.0,"name":"甲"}}'.encode("utf-8")
+        self._assert_400_mismatch(
+            "exact 带额外键 name", "/exact", acceptance_body
+        )
+        self._assert_configured_503(
+            "subset 带额外键 name", "/subset", acceptance_body
+        )
+
+    def test_deleting_name_passes_both_modes(self):
+        # 删除额外键 name 后：两条路由都返回配置的 503 与配置正文
+        for label, raw_body in [
+            ("id 写为 1.0", b'{"user":{"id":1.0}}'),
+            ("id 写为整数 1", b'{"user":{"id":1}}'),
+        ]:
+            with self.subTest(正文=label):
+                self._assert_configured_503(label, "/exact", raw_body)
+                self._assert_configured_503(label, "/subset", raw_body)
+
+    def test_mismatching_valid_bodies_return_400_in_both_modes(self):
+        # 缺少样例键、被约束值不同、类型不符：两种模式结果一致
+        for target in ("/exact", "/subset"):
+            for label, raw_body in ACCEPTANCE_MISMATCH_CASES:
+                with self.subTest(路由=target, 正文=label):
+                    self._assert_400_mismatch(label, target, raw_body)
+
+    def test_malformed_bodies_return_400_in_both_modes(self):
+        # 空正文、非法 UTF-8、JSON 语法错误、非有限数字：同一 400 正文
+        for target in ("/exact", "/subset"):
+            for label, raw_body in ACCEPTANCE_MALFORMED_CASES:
+                with self.subTest(路由=target, 正文=label):
+                    self._assert_400_mismatch(label, target, raw_body)
+
+    def test_subset_extra_fields_cannot_bypass_full_body_checks(self):
+        # subset 的额外字段同样参与完整正文的 UTF-8/语法/非有限数字检查，
+        # 不能借额外键夹带 NaN/Infinity/溢出数字或语法错误
+        for label, raw_body in SUBSET_EXTRA_FIELD_BAD_CASES:
+            with self.subTest(正文=label):
+                self._assert_400_mismatch(label, "/subset", raw_body)
+        # 非法 UTF-8 与语法错误在 extra 字段位置同样失败
+        self._assert_400_mismatch(
+            "额外字段处 JSON 语法错误",
+            "/subset", b'{"user":{"id":1},"extra":}',
+        )
+
+    def test_failure_uses_neither_configured_status_body_nor_delay(self):
+        # 两条路由都配置了 503 且无延迟：校验失败必须返回 400 与统一
+        # 不匹配正文，并立即响应（不等待、不采用配置的状态或正文）
+        bad_body = '{"user":{"id":1.0,"name":"甲"}}'.encode("utf-8")
+        start = time.monotonic()
+        self._assert_400_mismatch(
+            "exact 不匹配", "/exact", bad_body
+        )
+        self.assertLess(
+            time.monotonic() - start, NO_DELAY_MAX_SECONDS,
+            "exact 不匹配时不应人为等待",
+        )
+        start = time.monotonic()
+        self._assert_400_mismatch(
+            "subset 缺键不匹配", "/subset", b'{"user":{}}'
+        )
+        self.assertLess(
+            time.monotonic() - start, NO_DELAY_MAX_SECONDS,
+            "subset 不匹配时不应人为等待",
+        )
+
+    def test_query_string_still_ignored(self):
+        for target in ("/exact?x=1", "/subset?y=2&z=3"):
+            with self.subTest(目标=target):
+                status, headers, raw = request(
+                    self.port, "POST", target, body=b'{"user":{"id":1.0}}'
+                )
+                self.assertEqual(status, 503)
+                self.assertEqual(raw, ACCEPTED_BODY)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+
+    def test_unmatched_route_remains_404_even_with_invalid_body(self):
+        # 未命中不做请求体校验：即使正文非法也返回 404 route_not_found
+        for label, raw_body in [
+            ("非法 UTF-8", b"\xff"),
+            ("JSON 语法错误", b"{"),
+            ("与样例相等的合法 JSON", b'{"user":{"id":1}}'),
+            ("空正文", b""),
+        ]:
+            with self.subTest(正文=label):
+                status, headers, raw = request(
+                    self.port, "POST", "/missing", body=raw_body
+                )
+                self.assertEqual(status, 404)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                self.assertEqual(raw, NOT_FOUND_BODY)
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_other_methods_keep_501_behavior(self):
+        # PUT/HEAD 在两条校验路由上仍走既有的 501 流程，不读样例、不校验
+        status, headers, raw = request(
+            self.port, "PUT", "/exact", body=b'{"user":{"id":1}}'
+        )
+        self.assertEqual(status, 501)
+        self.assertEqual(headers.get("Connection"), "close")
+        self.assertEqual(raw, METHOD_REJECT_BODY)
+
+        status, headers, raw = request(self.port, "HEAD", "/subset")
+        self.assertEqual(status, 501)
+        self.assertEqual(raw, b"")
+        self.assertEqual(
+            int(headers["Content-Length"]), len(METHOD_REJECT_BODY)
+        )
+
+
+# ---------------------------------------------------------------------------
+# 数组长度/顺序与数组元素对象的两种模式回归
+#
+# 样例 {"items":[{"id":1},{"id":2}]} 在两种模式下都要求数组长度与顺序
+# 一致；仅当元素为对象时，subset 允许元素对象带额外键。
+# ---------------------------------------------------------------------------
+
+ARRAY_MODE_ROUTES = [
+    {"method": "POST", "path": "/exact",
+     "requestBody": {"items": [{"id": 1}, {"id": 2}]},
+     "status": 503, "body": {"accepted": True}},
+    {"method": "POST", "path": "/subset", "requestBodyMode": "subset",
+     "requestBody": {"items": [{"id": 1}, {"id": 2}]},
+     "status": 503, "body": {"accepted": True}},
+]
+
+
+class RequestBodyArrayModesTests(unittest.TestCase):
+    """数组长度/顺序两模式一致；元素额外键仅 subset 放行。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_compare_arrays.json", ARRAY_MODE_ROUTES
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def test_array_length_and_order_changes_return_400_in_both_modes(self):
+        # 数组长度改变、顺序改变、元素缺键、被约束值不同、类型不符：
+        # 两种模式均为 400
+        bad_bodies = [
+            ("数组少一个元素（不接受前缀匹配）", b'{"items":[{"id":1}]}'),
+            ("数组多一个元素", b'{"items":[{"id":1},{"id":2},{"id":3}]}'),
+            ("空数组", b'{"items":[]}'),
+            ("元素顺序改变", b'{"items":[{"id":2},{"id":1}]}'),
+            ("第二个元素缺少 id 键", b'{"items":[{"id":1},{"x":2}]}'),
+            ("被约束值不同（id=3）", b'{"items":[{"id":1},{"id":3}]}'),
+            ("元素 id 为字符串", b'{"items":[{"id":1},{"id":"2"}]}'),
+            ("元素 id 为布尔", b'{"items":[{"id":1},{"id":true}]}'),
+            ("items 不是数组", b'{"items":{"id":1}}'),
+        ]
+        for target in ("/exact", "/subset"):
+            for label, raw_body in bad_bodies:
+                with self.subTest(路由=target, 正文=label):
+                    status, headers, raw = request(
+                        self.port, "POST", target, body=raw_body
+                    )
+                    self.assertEqual(
+                        status, 400,
+                        f"{target} {label}: 期望 400，实际 {status}；"
+                        f"{raw!r}",
+                    )
+                    self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+                    self.assertEqual(
+                        int(headers["Content-Length"]), len(raw)
+                    )
+
+    def test_matching_arrays_return_503_in_both_modes(self):
+        good_bodies = [
+            ("完全一致", b'{"items":[{"id":1},{"id":2}]}'),
+            ("id 写为浮点（数值相等）", b'{"items":[{"id":1.0},{"id":2.0}]}'),
+            ("键序与空白不同", b'{"items":[ {"id":1}, {"id":2} ]}'),
+        ]
+        for target in ("/exact", "/subset"):
+            for label, raw_body in good_bodies:
+                with self.subTest(路由=target, 正文=label):
+                    status, headers, raw = request(
+                        self.port, "POST", target, body=raw_body
+                    )
+                    self.assertEqual(status, 503)
+                    self.assertEqual(raw, ACCEPTED_BODY)
+                    self.assertEqual(
+                        int(headers["Content-Length"]), len(raw)
+                    )
+
+    def test_element_extra_keys_only_accepted_in_subset(self):
+        # 数组元素为对象：subset 允许元素对象带额外键，exact 不允许；
+        # 嵌套在元素对象中的对象同样适用 subset 规则
+        body = b'{"items":[{"id":1,"x":9},{"id":2,"y":8}]}'
+        status, headers, raw = request(
+            self.port, "POST", "/subset", body=body
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(raw, ACCEPTED_BODY)
+        status, headers, raw = request(
+            self.port, "POST", "/exact", body=body
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(raw, REQUEST_BODY_MISMATCH)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
