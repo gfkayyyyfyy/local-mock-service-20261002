@@ -23,16 +23,23 @@ PATH_MODES = ("exact", "prefix")
 # bodyMode 的合法取值：省略或 "fixed" 为原有的固定响应（body 含占位符
 # 也原样返回），"template" 将 body 字符串值中的 {{request.path}} 替换为
 # 本次用于匹配的路径、{{request.method}} 替换为本次请求方法的大写形式
-# （GET 或 POST）；取值区分大小写
+# （GET 或 POST）、{{request.query}} 替换为本次请求目标中的原始查询串
+# （第一个问号之后、井号之前的文本，不解码、不校验）；取值区分大小写
 BODY_MODES = ("fixed", "template")
-# template 模式下唯一识别的两个占位符：带空格、大小写不同的写法及其他
+# template 模式下唯一识别的三个占位符：带空格、大小写不同的写法及其他
 # 占位符均保持原样
 PATH_PLACEHOLDER = "{{request.path}}"
 METHOD_PLACEHOLDER = "{{request.method}}"
-# 单次自左向右扫描同时处理两个占位符，保证嵌入、重复与混合出现的占位符
-# 都被替换，且替换结果（如路径文本中恰含占位符形态的字符）不再参与处理
+QUERY_PLACEHOLDER = "{{request.query}}"
+# 单次自左向右扫描同时处理三个占位符，保证嵌入、重复与混合出现的占位符
+# 都被替换，且替换结果（如路径或查询文本中恰含占位符形态的字符）不再
+# 参与处理
 _TEMPLATE_PLACEHOLDER_RE = re.compile(
-    re.escape(PATH_PLACEHOLDER) + "|" + re.escape(METHOD_PLACEHOLDER)
+    re.escape(PATH_PLACEHOLDER)
+    + "|"
+    + re.escape(METHOD_PLACEHOLDER)
+    + "|"
+    + re.escape(QUERY_PLACEHOLDER)
 )
 
 
@@ -82,7 +89,8 @@ class Routes(dict):
     body_modes 为 {(method, path): "fixed"|"template"}，缺省 bodyMode 时
     记为 "fixed"，键集合与路由本身一致；
     template_bodies 为 {(method, path): body 原始 JSON 值}，仅含
-    bodyMode 为 "template" 的路由，供每次请求按当前方法与路径渲染。
+    bodyMode 为 "template" 的路由，供每次请求按当前方法、路径与查询串
+    渲染。
     """
 
 
@@ -187,30 +195,39 @@ def _json_subset(expected, actual):
     return _json_matches(expected, actual, allow_extra_keys=True)
 
 
-def _render_template(value, path, method):
+def _render_template(value, path, method, query):
     """template 模式的响应渲染：把字符串值中的 {{request.path}} 替换为
     本次用于匹配的路径（已去除查询串，大小写、尾斜杠与百分号转义按
     原样保留，不额外解码或规范化）、{{request.method}} 替换为本次请求
-    方法的大写形式（GET 或 POST，与查询参数和正文无关）。
+    方法的大写形式（GET 或 POST，与查询参数和正文无关）、
+    {{request.query}} 替换为本次请求目标中的原始查询串（第一个问号之后
+    至井号或目标结尾的文本，不含问号；没有查询串或仅有结尾问号时为空
+    字符串，保留参数顺序、重复参数、空值、没有等号的片段、加号与百分号
+    转义，不做解码、排序或类型转换，%ZZ 等文本也原样保留）。
 
     顶层及嵌套对象、数组中的字符串值均替换；对象键、非字符串值与
     JSON 结构保持不变。正则自左向右单次扫描，嵌入、重复或混合出现
-    的占位符都被替换，且不会再次处理替换结果（路径或方法文本中即使
-    含有占位符形态的字符也不会被二次替换）。带空格、大小写不同的
+    的占位符都被替换，且不会再次处理替换结果（路径、方法或查询文本中
+    即使含有占位符形态的字符也不会被二次替换）。带空格、大小写不同的
     写法及其他占位符保持原样，不执行任何表达式。
     """
     if isinstance(value, str):
-        return _TEMPLATE_PLACEHOLDER_RE.sub(
-            lambda match: path
-            if match.group(0) == PATH_PLACEHOLDER
-            else method,
-            value,
-        )
+        def _replace(match):
+            token = match.group(0)
+            if token == PATH_PLACEHOLDER:
+                return path
+            if token == METHOD_PLACEHOLDER:
+                return method
+            return query
+
+        return _TEMPLATE_PLACEHOLDER_RE.sub(_replace, value)
     if isinstance(value, list):
-        return [_render_template(item, path, method) for item in value]
+        return [
+            _render_template(item, path, method, query) for item in value
+        ]
     if isinstance(value, dict):
         return {
-            key: _render_template(item, path, method)
+            key: _render_template(item, path, method, query)
             for key, item in value.items()
         }
     return value
@@ -230,7 +247,8 @@ def load_rules(path):
     body_modes 属性为 {(method, path): "fixed"|"template"} 映射，每条
     路由都有键，缺省 bodyMode 时记为 "fixed"；
     template_bodies 属性为 {(method, path): body 原始 JSON 值} 映射，
-    仅包含 bodyMode 为 "template" 的路由，供每次命中按当前方法与路径渲染。
+    仅包含 bodyMode 为 "template" 的路由，供每次命中按当前方法、路径与
+    查询串渲染。
     """
     try:
         with open(path, "rb") as f:
@@ -450,7 +468,12 @@ def _make_handler(routes):
 
         def _respond(self):
             raw_body = self._read_body()
-            path = urlsplit(self.path).path
+            # 查询串取请求目标中第一个问号之后至井号或目标结尾的文本
+            # （不含问号）；urlsplit 不做解码或校验，%ZZ 等文本原样保留，
+            # 没有问号或仅有结尾问号时得到空字符串。查询串不参与路由选择
+            target = urlsplit(self.path)
+            path = target.path
+            query = target.query
             key = self._resolve(path)
             if key is None:
                 # 未命中即使正文非法也返回原有 404 正文，不做请求体校验
@@ -475,10 +498,11 @@ def _make_handler(routes):
             if routes.body_modes.get(key) == "template":
                 # 模板只作用于最终选中的路由：把 body 字符串值中的
                 # {{request.method}} 替换为本次请求方法（大写 GET 或
-                # POST）、{{request.path}} 替换为本次用于匹配的路径后
+                # POST）、{{request.path}} 替换为本次用于匹配的路径、
+                # {{request.query}} 替换为本次请求目标中的原始查询串后
                 # 再序列化，Content-Length 按替换后的 UTF-8 JSON 字节数给出
                 rendered = _render_template(
-                    routes.template_bodies[key], path, self.command
+                    routes.template_bodies[key], path, self.command, query
                 )
                 body = json.dumps(
                     rendered, ensure_ascii=False, separators=(",", ":")

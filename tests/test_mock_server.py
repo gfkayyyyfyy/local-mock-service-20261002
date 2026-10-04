@@ -4979,13 +4979,14 @@ class PathModeBackwardCompatibilityTests(unittest.TestCase):
 # bodyMode 为可选的区分大小写字段：省略或 "fixed" 保持固定响应（body 含
 # 占位符也原样返回）；"template" 把 body 字符串值中的 {{request.path}}
 # 替换为本次用于匹配的路径、{{request.method}} 替换为本次请求方法的大写
-# 形式。其他取值使 load_rules 抛出 RulesError，命令行以退出码 2 结束且
-# 不监听。
+# 形式、{{request.query}} 替换为本次请求目标中的原始查询串（第一个问号
+# 之后至井号或结尾的文本，不做解码或校验）。其他取值使 load_rules 抛出
+# RulesError，命令行以退出码 2 结束且不监听。
 # ---------------------------------------------------------------------------
 
 
 class BodyModeTemplateTests(unittest.TestCase):
-    """bodyMode "template"：按本次请求方法与路径渲染 body 中的字符串值。"""
+    """bodyMode "template"：按本次请求方法、路径与查询串渲染 body 字符串值。"""
 
     def _start(self, tmp, name, routes):
         rules_path = write_rules(tmp, name, routes)
@@ -5041,7 +5042,7 @@ class BodyModeTemplateTests(unittest.TestCase):
 
     def test_nested_values_replaced_keys_and_scalars_untouched(self):
         # 顶层及嵌套对象、数组中的字符串值均替换；对象键（即使形如占位符）、
-        # 非字符串值与 JSON 结构不变；嵌入、重复或混合出现的两个占位符均替换
+        # 非字符串值与 JSON 结构不变；嵌入、重复或混合出现的三个占位符均替换
         body = {
             "{{request.path}}": "键名保持原样 {{request.path}}",
             "plain": "prefix-{{request.path}}-{{request.path}}-suffix",
@@ -5052,7 +5053,10 @@ class BodyModeTemplateTests(unittest.TestCase):
             "method_spaced": "{{ request.method }}",
             "method_case": "{{Request.Method}}",
             "mix": "{{request.method}} {{request.path}} {{request.method}}",
-            "other": "{{request.query}}",
+            "query_plain": "{{request.query}}",
+            "query_mix": "q={{request.query}}|{{request.path}}",
+            "query_case": "{{Request.Query}}",
+            "other": "{{request.other}}",
             "empty": "",
         }
         with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
@@ -5060,7 +5064,7 @@ class BodyModeTemplateTests(unittest.TestCase):
                 {"method": "GET", "path": "/t", "bodyMode": "template",
                  "body": body},
             ])
-            status, headers, raw = request(port, "GET", "/t?y=2")
+            status, headers, raw = request(port, "GET", "/t?y=2&b")
             self.assertEqual(status, 200)
             self.assertEqual(
                 json.loads(raw.decode("utf-8")),
@@ -5073,7 +5077,10 @@ class BodyModeTemplateTests(unittest.TestCase):
                     "method_spaced": "{{ request.method }}",
                     "method_case": "{{Request.Method}}",
                     "mix": "GET /t GET",
-                    "other": "{{request.query}}",
+                    "query_plain": "y=2&b",
+                    "query_mix": "q=y=2&b|/t",
+                    "query_case": "{{Request.Query}}",
+                    "other": "{{request.other}}",
                     "empty": "",
                 },
             )
@@ -5242,6 +5249,224 @@ class BodyModeTemplateTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         int(headers["Content-Length"]), len(raw)
+                    )
+
+    def test_query_echo_spec_example_and_no_carryover_on_same_connection(self):
+        # 规格样例：规则 {"routes":[{"method":"GET","path":"/echo",
+        # "bodyMode":"template","body":{"q":"{{request.query}}"}}]}
+        # GET /echo?tag=a+z&tag=&flag&x=%2f 返回 200 与
+        # {"q":"tag=a+z&tag=&flag&x=%2f"}；同一连接随后无查询串请求
+        # 返回 {"q":""}，不沿用前次查询内容
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_spec.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"q": "{{request.query}}"}},
+            ])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                conn.request(
+                    "GET", "/echo?tag=a+z&tag=&flag&x=%2f"
+                )
+                resp = conn.getresponse()
+                raw = resp.read()
+                self.assertEqual(resp.status, 200)
+                expected_query = "tag=a+z&tag=&flag&x=%2f"
+                expected = json.dumps(
+                    {"q": expected_query},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+                self.assertEqual(raw, expected)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")),
+                    {"q": expected_query},
+                )
+                self.assertEqual(
+                    int(resp.getheader("Content-Length")), len(expected)
+                )
+                # 同一连接、无查询串：回显空字符串
+                conn.request("GET", "/echo")
+                resp = conn.getresponse()
+                raw = resp.read()
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(raw, b'{"q":""}')
+                self.assertEqual(
+                    int(resp.getheader("Content-Length")), len(raw)
+                )
+                # 仅结尾问号同样回显空字符串
+                conn.request("GET", "/echo?")
+                resp = conn.getresponse()
+                raw = resp.read()
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(raw, b'{"q":""}')
+            finally:
+                conn.close()
+
+    def test_query_text_kept_verbatim_without_decode_or_validation(self):
+        # 查询文本保留参数顺序、重复参数、空值、没有等号的片段、加号与
+        # 百分号转义；不做解码、排序或类型转换，%ZZ 也原样返回，不返回 400
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_verbatim.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"q": "{{request.query}}"}},
+            ])
+            cases = [
+                "b=2&a=1&a=1&a=0",
+                "empty=&flag&=nokey&z=",
+                "plus=a+b+c&enc=%2f%2F%41%25",
+                "bad=%ZZ&also=%zz&good=%2f",
+                "x=1&",
+                "q=%E4%BD%A0%E5%A5%BD&p=a%20b",
+                "a={{request.path}}&b={{request.method}}",
+                "x=1#fragment-ignored",
+            ]
+            for raw_target in cases:
+                with self.subTest(target=raw_target):
+                    status, headers, raw = request(
+                        port, "GET", "/echo?" + raw_target
+                    )
+                    self.assertEqual(status, 200)
+                    expected_query = raw_target.split("#", 1)[0]
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"q": expected_query},
+                    )
+                    self.assertEqual(
+                        int(headers["Content-Length"]), len(raw)
+                    )
+
+    def test_query_placeholder_in_nested_and_top_level_strings(self):
+        # 顶层字符串及嵌套对象、数组中的字符串值均可替换；对象键不变
+        body = {
+            "top": "{{request.query}}",
+            "nested": {"list": ["{{request.query}}", {"q": "x={{request.query}}"}]},
+            "{{request.query}}": "key untouched",
+            "num": 1,
+            "nil": None,
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_nested.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": body},
+            ])
+            status, headers, raw = request(port, "GET", "/echo?a=1&b=2")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {
+                    "top": "a=1&b=2",
+                    "nested": {
+                        "list": ["a=1&b=2", {"q": "x=a=1&b=2"}],
+                    },
+                    "{{request.query}}": "key untouched",
+                    "num": 1,
+                    "nil": None,
+                },
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_query_replacement_text_is_not_reprocessed(self):
+        # 替换得到的查询文本即使含 {{request.path}} 等占位符形态也不再展开
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_reprocess.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"q": "{{request.query}}"}},
+            ])
+            target = "/echo?t={{request.path}}&m={{request.method}}&q={{request.query}}"
+            status, _, raw = request(port, "GET", target)
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"q": target.split("?", 1)[1]},
+            )
+
+    def test_query_echo_works_for_post_with_and_without_body_check(self):
+        # GET 与 POST 均适用：POST 模板路由同样回显原始查询串；
+        # requestBody 校验失败时仍返回 400 request_body_mismatch，
+        # 不渲染模板
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_post.json", [
+                {"method": "POST", "path": "/echo", "bodyMode": "template",
+                 "body": {"q": "{{request.query}}"}},
+                {"method": "POST", "path": "/checked", "bodyMode": "template",
+                 "requestBody": {"ok": True},
+                 "body": {"q": "{{request.query}}"}},
+            ])
+            status, headers, raw = request(
+                port, "POST", "/echo?a=1&flag&b=", body=b'{"anything":1}'
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"q": "a=1&flag&b="},
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+            # 无查询串的 POST 回显空字符串
+            status, _, raw = request(port, "POST", "/echo", body=b"")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw.decode("utf-8")), {"q": ""})
+            # 正文不匹配：不渲染模板、不用配置正文，返回固定 400
+            status, _, raw = request(
+                port, "POST", "/checked?should=not_appear",
+                body=b'{"ok":false}',
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"error": "request_body_mismatch"},
+            )
+
+    def test_fixed_and_default_mode_keep_query_placeholder_verbatim(self):
+        # fixed 或默认模式下 {{request.query}} 与另外两个占位符均原样返回
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_fixed.json", [
+                {"method": "GET", "path": "/default",
+                 "body": {"q": "{{request.query}}",
+                          "all": "{{request.method}} {{request.path}} "
+                                 "{{request.query}}"}},
+                {"method": "GET", "path": "/fixed", "bodyMode": "fixed",
+                 "body": {"q": "{{request.query}}"}},
+            ])
+            status_default, _, raw_default = request(
+                port, "GET", "/default?a=1"
+            )
+            self.assertEqual(status_default, 200)
+            self.assertEqual(
+                json.loads(raw_default.decode("utf-8")),
+                {"q": "{{request.query}}",
+                 "all": "{{request.method}} {{request.path}} "
+                        "{{request.query}}"},
+            )
+            status_fixed, _, raw_fixed = request(
+                port, "GET", "/fixed?a=1"
+            )
+            self.assertEqual(status_fixed, 200)
+            self.assertEqual(
+                json.loads(raw_fixed.decode("utf-8")),
+                {"q": "{{request.query}}"},
+            )
+
+    def test_query_does_not_participate_in_routing(self):
+        # 查询串不参与路由选择：prefix 模板路由按路径命中并回显各自查询串
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_query_routing.json", [
+                {"method": "GET", "path": "/echo/", "pathMode": "prefix",
+                 "bodyMode": "template",
+                 "body": {"path": "{{request.path}}",
+                          "query": "{{request.query}}"}},
+            ])
+            for target, expected_path, expected_query in (
+                ("/echo/a?x=1&x=2", "/echo/a", "x=1&x=2"),
+                ("/echo/a/b?flag", "/echo/a/b", "flag"),
+                ("/echo/a", "/echo/a", ""),
+            ):
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"path": expected_path, "query": expected_query},
                     )
 
     def test_template_applies_only_to_selected_route(self):
