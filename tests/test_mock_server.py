@@ -6128,5 +6128,237 @@ class DelayedTemplateCheckedRouteTests(unittest.TestCase):
                 server.stop()
 
 
+# ---------------------------------------------------------------------------
+# --check-rules 入口：校验规则后自行退出
+#
+# 这些用例只通过 `python -m mock_server --check-rules` 真实命令行入口
+# 观察公开行为（退出码、标准输出、标准错误），不直接调用 load_rules 等
+# 内部函数代替。检查过程不绑定或探测端口（端口被占用也不影响）、不模拟
+# 请求、不展开模板、不按 delayMs 等待，成功或失败都在
+# CHECK_RULES_TIMEOUT 内自行退出。
+# ---------------------------------------------------------------------------
+
+CHECK_RULES_TIMEOUT = 10.0
+STOPPED_MARKER = "mock_server stopped"
+
+
+def run_check_rules(rules_path, port=None):
+    """经 `python -m mock_server --check-rules` 入口运行并等待自行退出。
+
+    port 为 None 时省略 --port（走默认值），否则追加 --port。返回
+    (returncode, stdout, stderr)。CHECK_RULES_TIMEOUT 内未退出则杀掉进程
+    并以 AssertionError 判失败（而非等待用户中断）。无论正常返回还是超时，
+    返回前都回收子进程与管道，避免残留进程与文件描述符泄漏。
+    """
+    command = [
+        sys.executable,
+        "-m",
+        "mock_server",
+        "--rules",
+        str(rules_path),
+        "--check-rules",
+    ]
+    if port is not None:
+        command.extend(["--port", str(port)])
+    proc = subprocess.Popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=CHECK_RULES_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(
+                f"mock_server --check-rules 在 {CHECK_RULES_TIMEOUT}s 内"
+                f"未自行退出（pid={proc.pid}）；"
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
+        return proc.returncode, stdout, stderr
+    finally:
+        # 成功与异常分支都确保子进程已回收、管道已关闭
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, ValueError):
+                pass
+
+
+class CheckRulesTests(unittest.TestCase):
+    """--check-rules：只校验规则并退出，不改变产品的正常启动行为。"""
+
+    # 两条合法规则：template 与 2000ms 延迟只验证它们作为规则内容被接受，
+    # 检查过程不渲染模板、不按延迟等待，也不发送任何请求
+    VALID_ROUTES = [
+        {"method": "GET", "path": "/hello",
+         "body": {"message": "你好"}},
+        {"method": "POST", "path": "/echo", "bodyMode": "template",
+         "body": "{{request.path}}", "delayMs": 2000},
+    ]
+
+    def _assert_check_success(self, rules_path, route_count, port=None):
+        returncode, stdout, stderr = run_check_rules(rules_path, port)
+        self.assertEqual(
+            returncode, 0,
+            f"合法规则应以退出码 0 结束，实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        # 标准输出有且仅有一行成功提示（universal newlines 下末尾为 \n），
+        # 不出现监听或停止提示，标准错误为空
+        self.assertEqual(
+            stdout,
+            f"mock_server rules valid ({route_count} route(s))\n",
+            f"标准输出应只有规则有效这一行，实际 stdout={stdout!r}",
+        )
+        self.assertNotIn(STARTUP_MARKER, stdout)
+        self.assertNotIn(STOPPED_MARKER, stdout)
+        self.assertEqual(stderr, "", f"标准错误应为空，实际 stderr={stderr!r}")
+
+    def test_valid_rules_succeeds_without_port(self):
+        # 省略 --port：只做规则校验，默认端口不被绑定或探测
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_check_valid.json", self.VALID_ROUTES
+            )
+            self._assert_check_success(rules_path, 2)
+
+    def test_empty_routes_reports_zero(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_check_empty.json", [])
+            self._assert_check_success(rules_path, 0)
+
+    def test_valid_rules_succeeds_when_port_occupied(self):
+        # --port 指向一个已被本地监听器占用的端口：规则检查仍成功，
+        # 不绑定该端口，原监听器仍归占用者所有且可继续接受连接
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_check_occupied_port.json", self.VALID_ROUTES
+            )
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                listener.settimeout(5)
+                port = listener.getsockname()[1]
+                self._assert_check_success(rules_path, 2, port=port)
+                # 检查结束后原监听器仍可正常完成一次连接接受
+                with socket.create_connection(
+                    ("127.0.0.1", port), timeout=5
+                ):
+                    accepted, _ = listener.accept()
+                    try:
+                        # accept 成功即证明端口仍由原监听器持有且可用
+                        self.assertIsNotNone(accepted)
+                    finally:
+                        accepted.close()
+            finally:
+                listener.close()
+
+    def test_invalid_rules_exit_2_with_error_on_stderr(self):
+        # 规则加载类失败：退出码 2，stderr 以 'error:' 开头并含对应原因，
+        # stdout 为空，不出现 Traceback
+        cases = [
+            (
+                "JSON 语法错误",
+                '{"routes": [',
+                "not valid JSON",
+            ),
+            (
+                "bodyMode 取值大小写错误",
+                json.dumps(
+                    {"routes": [
+                        {"method": "GET", "path": "/x",
+                         "bodyMode": "Template", "body": {}}
+                    ]},
+                    ensure_ascii=False,
+                ),
+                "routes[0].bodyMode",
+            ),
+            (
+                "被忽略的额外字段含溢出数字 1e400",
+                '{"routes":[{"method":"GET","path":"/ok","body":{}}],'
+                '"extra":{"n":1e400}}',
+                "non-finite number",
+            ),
+        ]
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, text, reason) in enumerate(cases):
+                with self.subTest(样例=label):
+                    rules_path = write_rules_text(
+                        tmp, f"rules_check_bad_{index}.json", text
+                    )
+                    returncode, stdout, stderr = run_check_rules(rules_path)
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertTrue(
+                        stderr.startswith("error: "),
+                        f"样例 {label}: 规则加载错误应以 'error:' 开头，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertIn(
+                        reason, stderr,
+                        f"样例 {label}: 标准错误应包含 {reason!r}，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertEqual(
+                        stdout, "",
+                        f"样例 {label}: 失败时标准输出应为空，"
+                        f"实际 stdout={stdout!r}",
+                    )
+                    self.assertNotIn(
+                        "Traceback", stderr,
+                        f"样例 {label}: 不应出现 Python 异常回溯，"
+                        f"实际 stderr={stderr!r}",
+                    )
+
+    def test_invalid_port_exit_2_with_argparse_error(self):
+        # 参数类失败：保留现有 argparse 表达（usage 行 + error 行），
+        # 退出码 2，stdout 为空，不出现 Traceback
+        cases = [
+            ("abc", "invalid port 'abc': must be an integer"),
+            ("0", "invalid port '0': must be between 1 and 65535"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_check_bad_port.json", self.VALID_ROUTES
+            )
+            for bad_port, reason in cases:
+                with self.subTest(port=bad_port):
+                    returncode, stdout, stderr = run_check_rules(
+                        rules_path, port=bad_port
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"--port {bad_port}: 期望退出码 2，实际 "
+                        f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn("usage: mock_server", stderr)
+                    self.assertIn(
+                        "mock_server: error: argument --port:", stderr
+                    )
+                    self.assertIn(
+                        reason, stderr,
+                        f"--port {bad_port}: 标准错误应包含 {reason!r}，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertEqual(
+                        stdout, "",
+                        f"--port {bad_port}: 参数错误时标准输出应为空，"
+                        f"实际 stdout={stdout!r}",
+                    )
+                    self.assertNotIn("Traceback", stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
