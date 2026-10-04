@@ -4973,5 +4973,297 @@ class PathModeBackwardCompatibilityTests(unittest.TestCase):
             server.stop()
 
 
+# ---------------------------------------------------------------------------
+# bodyMode 回归
+#
+# bodyMode 为可选的区分大小写字段：省略或 "fixed" 保持固定响应（body 含
+# 占位符也原样返回）；"template" 把 body 字符串值中的 {{request.path}}
+# 替换为本次用于匹配的路径。其他取值使 load_rules 抛出 RulesError，
+# 命令行以退出码 2 结束且不监听。
+# ---------------------------------------------------------------------------
+
+
+class BodyModeTemplateTests(unittest.TestCase):
+    """bodyMode "template"：按本次请求路径渲染 body 中的字符串值。"""
+
+    def _start(self, tmp, name, routes):
+        rules_path = write_rules(tmp, name, routes)
+        port = free_port()
+        server = ServerProcess(rules_path, port)
+        self.addCleanup(server.stop)
+        return port
+
+    def test_spec_example_prefix_echo_percent_escaped(self):
+        # 规格样例：prefix /echo/ + 模板 "{{request.path}}"，
+        # GET /echo/a%20b?x=1 返回 200 与 JSON 字符串 "/echo/a%20b"
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_echo.json", [
+                {"method": "GET", "path": "/echo/", "pathMode": "prefix",
+                 "bodyMode": "template", "body": "{{request.path}}"},
+            ])
+            status, headers, raw = request(port, "GET", "/echo/a%20b?x=1")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+            expected = json.dumps(
+                "/echo/a%20b", ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            self.assertEqual(raw, expected)
+            self.assertEqual(json.loads(raw.decode("utf-8")), "/echo/a%20b")
+            # Content-Length 按替换后的 UTF-8 JSON 字节数给出
+            self.assertEqual(int(headers["Content-Length"]), len(expected))
+
+    def test_each_request_echoes_its_own_path_verbatim(self):
+        # 每次请求回显当前路径：大小写、尾斜杠与百分号转义按原样保留，
+        # 查询串被去除，不额外解码或规范化
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_echo_each.json", [
+                {"method": "GET", "path": "/echo/", "pathMode": "prefix",
+                 "bodyMode": "template", "body": {"path": "{{request.path}}"}},
+            ])
+            cases = [
+                ("/echo/a%20b?x=1", "/echo/a%20b"),
+                ("/echo/Mixed/Case/", "/echo/Mixed/Case/"),
+                ("/echo/%2F%41", "/echo/%2F%41"),
+                ("/echo/%E4%BD%A0%E5%A5%BD", "/echo/%E4%BD%A0%E5%A5%BD"),
+            ]
+            for target, expected_path in cases:
+                with self.subTest(target=target):
+                    status, headers, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"path": expected_path},
+                    )
+                    self.assertEqual(
+                        int(headers["Content-Length"]), len(raw)
+                    )
+
+    def test_nested_values_replaced_keys_and_scalars_untouched(self):
+        # 顶层及嵌套对象、数组中的字符串值均替换；对象键（即使形如占位符）、
+        # 非字符串值与 JSON 结构不变；嵌入或重复的占位符均替换
+        body = {
+            "{{request.path}}": "键名保持原样 {{request.path}}",
+            "plain": "prefix-{{request.path}}-{{request.path}}-suffix",
+            "nested": {"list": ["{{request.path}}", 1, 1.5, True, None,
+                                ["{{request.path}}"]]},
+            "spaced": "{{ request.path }}",
+            "case": "{{Request.Path}}",
+            "other": "{{request.method}}",
+            "empty": "",
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_nested.json", [
+                {"method": "GET", "path": "/t", "bodyMode": "template",
+                 "body": body},
+            ])
+            status, headers, raw = request(port, "GET", "/t?y=2")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {
+                    "{{request.path}}": "键名保持原样 /t",
+                    "plain": "prefix-/t-/t-suffix",
+                    "nested": {"list": ["/t", 1, 1.5, True, None, ["/t"]]},
+                    "spaced": "{{ request.path }}",
+                    "case": "{{Request.Path}}",
+                    "other": "{{request.method}}",
+                    "empty": "",
+                },
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_top_level_scalar_bodies_render(self):
+        # body 为任意 JSON 值：顶层字符串、数字、null 均合法；
+        # 非字符串值不含可替换内容，原样返回
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_scalar.json", [
+                {"method": "GET", "path": "/s", "bodyMode": "template",
+                 "body": "{{request.path}}"},
+                {"method": "GET", "path": "/n", "bodyMode": "template",
+                 "body": 42},
+                {"method": "GET", "path": "/nil", "bodyMode": "template",
+                 "body": None},
+            ])
+            status, _, raw = request(port, "GET", "/s")
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, b'"/s"')
+            status, _, raw = request(port, "GET", "/n")
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, b"42")
+            status, _, raw = request(port, "GET", "/nil")
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, b"null")
+
+    def test_fixed_mode_returns_placeholder_verbatim(self):
+        # 省略 bodyMode 或显式 "fixed"：body 含占位符也原样返回
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_fixed.json", [
+                {"method": "GET", "path": "/default",
+                 "body": {"p": "{{request.path}}"}},
+                {"method": "GET", "path": "/fixed", "bodyMode": "fixed",
+                 "body": {"p": "{{request.path}}"}},
+            ])
+            for target in ("/default", "/fixed"):
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"p": "{{request.path}}"},
+                    )
+
+    def test_template_applies_only_to_selected_route(self):
+        # 精确优先、最长前缀匹配保持不变；模板只作用于最终选中的路由
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_select.json", [
+                {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                 "bodyMode": "template", "body": {"v": "{{request.path}}"}},
+                {"method": "GET", "path": "/api/v1/", "pathMode": "prefix",
+                 "bodyMode": "template", "body": {"v": "{{request.path}}"}},
+                {"method": "GET", "path": "/api/v1/ping",
+                 "body": {"v": "fixed"}},
+            ])
+            cases = [
+                ("/api/x", {"v": "/api/x"}),
+                ("/api/v1/x", {"v": "/api/v1/x"}),
+                ("/api/v1/ping?x=1", {"v": "fixed"}),
+            ]
+            for target, expected in cases:
+                with self.subTest(target=target):
+                    status, _, raw = request(port, "GET", target)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(raw.decode("utf-8")), expected)
+            # 前缀剩余部分为空仍不命中
+            status, _, raw = request(port, "GET", "/api/")
+            self.assertEqual(status, 404)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")), {"error": "route_not_found"}
+            )
+
+    def test_template_route_keeps_status_and_mismatch_behaviour(self):
+        # 命中且校验通过时沿用配置状态；POST 正文校验失败仍返回 400 与
+        # request_body_mismatch，不使用模板与配置状态，不回退其他候选
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_post.json", [
+                {"method": "POST", "path": "/submit",
+                 "bodyMode": "template", "status": 503,
+                 "requestBody": {"token": "abc"},
+                 "body": {"echo": "{{request.path}}"}},
+                {"method": "POST", "path": "/submit/", "pathMode": "prefix",
+                 "body": {"v": "fallback"}},
+            ])
+            # 校验通过：配置状态 503 + 模板渲染后的 body
+            status, headers, raw = request(
+                port, "POST", "/submit", body=b'{"token":"abc"}'
+            )
+            self.assertEqual(status, 503)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")), {"echo": "/submit"}
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+            # 校验失败：400 与固定错误体，不回退到 /submit/ 前缀候选
+            status, _, raw = request(
+                port, "POST", "/submit", body=b'{"token":"wrong"}'
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"error": "request_body_mismatch"},
+            )
+
+    def test_load_rules_return_shape_and_defaults(self):
+        # load_rules 返回格式保持兼容：body_modes 每条路由都有键，
+        # 缺省记为 "fixed"；template_bodies 仅含 template 路由的原始值
+        from mock_server import load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_shape.json", [
+                {"method": "GET", "path": "/old", "body": {"ok": True}},
+                {"method": "GET", "path": "/t", "bodyMode": "template",
+                 "body": {"p": "{{request.path}}"}},
+            ])
+            routes = load_rules(rules_path)
+            self.assertEqual(
+                routes[("GET", "/old")], (200, b'{"ok":true}')
+            )
+            self.assertEqual(routes.body_modes[("GET", "/old")], "fixed")
+            self.assertEqual(routes.body_modes[("GET", "/t")], "template")
+            self.assertEqual(
+                routes.template_bodies[("GET", "/t")],
+                {"p": "{{request.path}}"},
+            )
+            self.assertNotIn(("GET", "/old"), routes.template_bodies)
+
+
+INVALID_BODY_MODES = [
+    ('大小写不同 "Fixed"', "Fixed"),
+    ('大小写不同 "TEMPLATE"', "TEMPLATE"),
+    ("null", None),
+    ("布尔 true", True),
+    ("数字 1", 1),
+    ("空数组 []", []),
+    ("空对象 {}", {}),
+]
+
+
+class InvalidBodyModeTests(unittest.TestCase):
+    """非法 bodyMode：load_rules 抛 RulesError，CLI 退出码 2 且不监听。"""
+
+    def test_load_rules_raises_rules_error(self):
+        from mock_server import RulesError, load_rules
+
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_mode) in enumerate(INVALID_BODY_MODES):
+                with self.subTest(样例=label):
+                    rules_path = write_rules(
+                        tmp, f"rules_bm_{index}.json",
+                        [{"method": "GET", "path": "/x",
+                          "bodyMode": bad_mode, "body": {}}],
+                    )
+                    with self.assertRaises(
+                        RulesError,
+                        msg=f"样例 {label}: load_rules 应抛出 RulesError",
+                    ) as ctx:
+                        load_rules(rules_path)
+                    message = str(ctx.exception)
+                    # 错误消息应指出路由位置及 bodyMode
+                    self.assertIn("routes[0].bodyMode", message)
+                    self.assertIn(repr(bad_mode), message)
+
+    def test_cli_rejects_invalid_body_mode_with_exit_code_2(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            for index, (label, bad_mode) in enumerate(INVALID_BODY_MODES):
+                with self.subTest(样例=label):
+                    # 非法项位于合法路由之后：错误应标明实际下标
+                    rules_path = write_rules(
+                        tmp, f"rules_bm_cli_{index}.json",
+                        [
+                            {"method": "GET", "path": "/ok",
+                             "body": {"fine": 1}},
+                            {"method": "GET", "path": "/x",
+                             "bodyMode": bad_mode, "body": {}},
+                        ],
+                    )
+                    returncode, stdout, stderr = start_and_wait_exit(
+                        rules_path, free_port()
+                    )
+                    self.assertEqual(
+                        returncode, 2,
+                        f"样例 {label}: 期望退出码 2，实际 {returncode}；"
+                        f"stdout={stdout!r} stderr={stderr!r}",
+                    )
+                    self.assertIn("routes[1].bodyMode", stderr)
+                    self.assertNotIn(
+                        "Traceback", stderr,
+                        f"样例 {label}: 不应出现 Python 异常回溯，"
+                        f"实际 stderr={stderr!r}",
+                    )
+                    self.assertNotIn(
+                        STARTUP_MARKER, stdout,
+                        f"样例 {label}: 校验失败时不应监听，"
+                        f"实际 stdout={stdout!r}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

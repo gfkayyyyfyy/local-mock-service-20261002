@@ -19,6 +19,13 @@ REQUEST_BODY_MODES = ("exact", "subset")
 # pathMode 的合法取值：省略或 "exact" 为原有的完整路径相等匹配，
 # "prefix" 将规则 path 作为前缀；取值区分大小写
 PATH_MODES = ("exact", "prefix")
+# bodyMode 的合法取值：省略或 "fixed" 为原有的固定响应（body 含占位符
+# 也原样返回），"template" 将 body 字符串值中的 {{request.path}} 替换为
+# 本次用于匹配的路径；取值区分大小写
+BODY_MODES = ("fixed", "template")
+# template 模式下唯一识别的占位符：带空格、大小写不同的写法及其他
+# 占位符均保持原样
+PATH_PLACEHOLDER = "{{request.path}}"
 
 
 class RulesError(Exception):
@@ -63,7 +70,11 @@ class Routes(dict):
     request_body_modes 为 {(method, path): "exact"|"subset"}，键集合与
     request_bodies 一致，缺省 requestBodyMode 时记为 "exact"；
     path_modes 为 {(method, path): "exact"|"prefix"}，缺省 pathMode 时
-    记为 "exact"，键集合与路由本身一致。
+    记为 "exact"，键集合与路由本身一致；
+    body_modes 为 {(method, path): "fixed"|"template"}，缺省 bodyMode 时
+    记为 "fixed"，键集合与路由本身一致；
+    template_bodies 为 {(method, path): body 原始 JSON 值}，仅含
+    bodyMode 为 "template" 的路由，供每次请求按当前路径渲染。
     """
 
 
@@ -168,6 +179,28 @@ def _json_subset(expected, actual):
     return _json_matches(expected, actual, allow_extra_keys=True)
 
 
+def _render_path_template(value, path):
+    """template 模式的响应渲染：把字符串值中的 {{request.path}} 替换为
+    本次用于匹配的路径（已去除查询串，大小写、尾斜杠与百分号转义按
+    原样保留，不额外解码或规范化）。
+
+    顶层及嵌套对象、数组中的字符串值均替换；对象键、非字符串值与
+    JSON 结构保持不变。str.replace 自左向右单次扫描，嵌入或重复的
+    占位符都被替换，且不会再次处理替换结果（路径文本中即使含有
+    占位符形态的字符也不会被二次替换）。不执行任何表达式。
+    """
+    if isinstance(value, str):
+        return value.replace(PATH_PLACEHOLDER, path)
+    if isinstance(value, list):
+        return [_render_path_template(item, path) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _render_path_template(item, path)
+            for key, item in value.items()
+        }
+    return value
+
+
 def load_rules(path):
     """加载并校验规则文件，返回 Routes：{(method, path): (状态码, 响应字节)}。
 
@@ -178,7 +211,11 @@ def load_rules(path):
     request_body_modes 属性为 {(method, path): "exact"|"subset"} 映射，
     键集合与 request_bodies 一致；
     path_modes 属性为 {(method, path): "exact"|"prefix"} 映射，每条路由
-    都有键，缺省 pathMode 时记为 "exact"。
+    都有键，缺省 pathMode 时记为 "exact"；
+    body_modes 属性为 {(method, path): "fixed"|"template"} 映射，每条
+    路由都有键，缺省 bodyMode 时记为 "fixed"；
+    template_bodies 属性为 {(method, path): body 原始 JSON 值} 映射，
+    仅包含 bodyMode 为 "template" 的路由。
     """
     try:
         with open(path, "rb") as f:
@@ -209,6 +246,8 @@ def load_rules(path):
     routes.request_bodies = {}
     routes.request_body_modes = {}
     routes.path_modes = {}
+    routes.body_modes = {}
+    routes.template_bodies = {}
     for index, item in enumerate(data["routes"]):
         where = f"routes[{index}]"
         if not isinstance(item, dict):
@@ -249,6 +288,14 @@ def load_rules(path):
             raise RulesError(
                 f"{where}.path for pathMode 'prefix' must end with '/', "
                 f"got {route_path!r}"
+            )
+        body_mode = item.get("bodyMode", "fixed")
+        if not isinstance(body_mode, str) or body_mode not in BODY_MODES:
+            # 其他字符串（含 "Fixed"、"TEMPLATE"）或非字符串值（null、
+            # 布尔、数字、数组、对象）一律拒绝；取值区分大小写
+            raise RulesError(
+                f"{where}.bodyMode must be 'fixed' or 'template', "
+                f"got {body_mode!r}"
             )
         request_body_sample = None
         if "requestBodyMode" in item:
@@ -311,6 +358,11 @@ def load_rules(path):
         routes[key] = (status, body)
         routes.delays[key] = delay_ms
         routes.path_modes[key] = path_mode
+        routes.body_modes[key] = body_mode
+        if body_mode == "template":
+            # 模板路由保留 body 的原始 JSON 值，每次命中按当前路径渲染；
+            # 上面的序列化已保证其中字符串值与对象键可编码为 UTF-8
+            routes.template_bodies[key] = item["body"]
         if "requestBody" in item:
             routes.request_bodies[key] = request_body_sample
             routes.request_body_modes[key] = item.get("requestBodyMode", "exact")
@@ -404,7 +456,18 @@ def _make_handler(routes):
             delay_ms = routes.delays.get(key, 0)
             if delay_ms:
                 time.sleep(delay_ms / 1000)
-            self._send(entry[0], entry[1])
+            status, body = entry
+            if routes.body_modes.get(key) == "template":
+                # 模板只作用于最终选中的路由：把 body 字符串值中的
+                # {{request.path}} 替换为本次用于匹配的路径后再序列化，
+                # Content-Length 按替换后的 UTF-8 JSON 字节数给出
+                rendered = _render_path_template(
+                    routes.template_bodies[key], path
+                )
+                body = json.dumps(
+                    rendered, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            self._send(status, body)
 
         def _send(self, status, body):
             self.send_response(status)
