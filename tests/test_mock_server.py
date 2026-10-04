@@ -4827,5 +4827,104 @@ class PathModeBackwardCompatibilityTests(unittest.TestCase):
             server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 多路由竞争时仅校验最终选中路由的回归
+#
+# 同一份临时规则包含三条 POST 路由：
+#   POST prefix /          无 requestBody，200 + JSON 字符串 "root"
+#   POST prefix /api/      subset 样例 {"v":1}，503 + JSON 字符串 "prefix"
+#   POST exact  /api/item  默认（exact）样例 {"v":9}，200 + JSON 字符串 "exact"
+# exact 优先于前缀、多个前缀候选取最长；路由选定后只按该路由的样例校验
+# 请求正文，校验失败返回 400，不回退到其他 exact/prefix 候选。规则在文件
+# 中的排列顺序不影响结果，因此原顺序与逆序各验证一遍。
+# ---------------------------------------------------------------------------
+
+SELECTED_ROUTE_RULES = [
+    {"method": "POST", "path": "/", "pathMode": "prefix", "body": "root"},
+    {"method": "POST", "path": "/api/", "pathMode": "prefix",
+     "requestBodyMode": "subset", "requestBody": {"v": 1},
+     "status": 503, "body": "prefix"},
+    {"method": "POST", "path": "/api/item",
+     "requestBody": {"v": 9}, "body": "exact"},
+]
+
+
+class SelectedRouteValidationTests(unittest.TestCase):
+    """多条路由竞争时，requestBody 只按最终选中的路由校验。"""
+
+    def _check(self, port, target, raw_body, expected_status, expected_json):
+        status, headers, raw = request(port, "POST", target, body=raw_body)
+        where = f"POST {target} 正文={raw_body!r}"
+        self.assertEqual(
+            status, expected_status,
+            f"{where}: 状态码预期 {expected_status}，实际 {status}；"
+            f"响应体={raw!r}",
+        )
+        content_type = headers.get("Content-Type")
+        self.assertEqual(
+            content_type, CONTENT_TYPE,
+            f"{where}: Content-Type 预期 {CONTENT_TYPE!r}，"
+            f"实际 {content_type!r}",
+        )
+        content_length = headers.get("Content-Length")
+        self.assertIsNotNone(content_length, f"{where}: 缺少 Content-Length")
+        self.assertEqual(
+            int(content_length), len(raw),
+            f"{where}: Content-Length={content_length} 与实际响应体字节数 "
+            f"{len(raw)} 不符；响应体={raw!r}",
+        )
+        actual_json = json.loads(raw.decode("utf-8"))
+        self.assertEqual(
+            actual_json, expected_json,
+            f"{where}: 响应 JSON 预期 {expected_json!r}，实际 {actual_json!r}",
+        )
+
+    def _run_suite(self, port):
+        mismatch = {"error": "request_body_mismatch"}
+        cases = [
+            # exact 命中且正文满足其样例：返回 exact 响应（查询串被忽略）
+            ("/api/item?x=1", b'{"v":9}', 200, "exact"),
+            # exact 优先被选中，正文只满足前缀样例：按 exact 样例校验
+            # 失败返回 400，不得改用前缀的 503 "prefix"
+            ("/api/item?x=1", b'{"v":1}', 400, mismatch),
+            # 前缀 /api/ subset 匹配：允许额外键，返回前缀的 503
+            ("/api/other", b'{"v":1,"extra":true}', 503, "prefix"),
+            # 缺少被约束的键：400，不得回退到根前缀的 "root"
+            ("/api/other", b'{"extra":true}', 400, mismatch),
+            # 布尔与数字互不相等：v=true 不满足样例 {"v":1}
+            ("/api/other", b'{"v":true}', 400, mismatch),
+            # subset 下完整正文仍须通过非有限数字检查：
+            # 额外字段中的 1e400 不能绕过
+            ("/api/other", b'{"v":1,"extra":1e400}', 400, mismatch),
+            # /api/ 对前缀 /api/ 剩余为空，不参与竞争；根前缀无样例，
+            # 忽略非 JSON 正文并返回其配置响应
+            ("/api/", b"not json", 200, "root"),
+        ]
+        for target, raw_body, expected_status, expected_json in cases:
+            with self.subTest(请求=f"POST {target}", 正文=raw_body):
+                self._check(
+                    port, target, raw_body, expected_status, expected_json
+                )
+
+    def test_only_selected_route_validates_request_body(self):
+        for order_label, routes in [
+            ("规则原顺序", SELECTED_ROUTE_RULES),
+            ("规则逆序", list(reversed(SELECTED_ROUTE_RULES))),
+        ]:
+            with self.subTest(规则顺序=order_label):
+                with tempfile.TemporaryDirectory(
+                    prefix="mock_server_test_"
+                ) as tmp:
+                    rules_path = write_rules(
+                        tmp, "rules_selected_route.json", routes
+                    )
+                    port = free_port()
+                    server = ServerProcess(rules_path, port)
+                    try:
+                        self._run_suite(port)
+                    finally:
+                        server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
