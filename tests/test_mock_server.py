@@ -5622,5 +5622,119 @@ class InvalidBodyModeTests(unittest.TestCase):
                     )
 
 
+# ---------------------------------------------------------------------------
+# 正文校验 + 模板渲染 + 路由延迟组合回归
+#
+# 一条同时配置 requestBody、bodyMode "template" 与 delayMs 的 POST 精确
+# 路由：正文校验决定是否进入“先等待配置时长、再渲染模板并返回配置状态”
+# 的既有流程。计时沿用 DelayBehaviorTests 的口径与容差：从发送请求前量到
+# 收到响应头，匹配分支不早于 DELAY_MIN_SECONDS（180ms），不匹配分支快于
+# NO_DELAY_MAX_SECONDS（150ms）。
+# ---------------------------------------------------------------------------
+
+
+class CheckedTemplateDelayTests(unittest.TestCase):
+    """POST /checked：正文匹配才进入延迟与模板响应，不匹配直接 400。"""
+
+    # 精确路由：requestBody 样例 {"ok":true}，模板正文回显方法、路径与
+    # 原始查询串，配置状态 503，每次命中先延迟 DELAY_MS（200ms）
+    ROUTE = {
+        "method": "POST",
+        "path": "/checked",
+        "requestBody": {"ok": True},
+        "bodyMode": "template",
+        "status": 503,
+        "delayMs": DELAY_MS,
+        "body": {
+            "text": "你好 {{request.method}} {{request.path}}?"
+                    "{{request.query}}",
+        },
+    }
+
+    def _assert_json_response(self, label, resp, raw, expected_status,
+                              expected_body):
+        self.assertEqual(
+            resp.status, expected_status,
+            f"{label}: 状态码应为 {expected_status}，实际 {resp.status}",
+        )
+        content_type = resp.getheader("Content-Type")
+        self.assertEqual(
+            content_type, CONTENT_TYPE,
+            f"{label}: Content-Type 应为 {CONTENT_TYPE!r}，"
+            f"实际 {content_type!r}",
+        )
+        content_length = resp.getheader("Content-Length")
+        self.assertIsNotNone(content_length, f"{label}: 缺少 Content-Length")
+        self.assertEqual(
+            int(content_length), len(raw),
+            f"{label}: Content-Length={content_length} "
+            f"与实际响应体字节数 {len(raw)} 不符",
+        )
+        # 中文内容必须能按 UTF-8 正确解析为预期 JSON 值
+        actual_body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(
+            actual_body, expected_body,
+            f"{label}: 响应 JSON 应为 {expected_body}，实际 {actual_body}",
+        )
+
+    def test_body_validation_gates_delay_and_template_on_same_connection(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(
+                tmp, "rules_checked_template.json", [self.ROUTE]
+            )
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                conn = HTTPConnection(
+                    "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+                )
+                try:
+                    # 第一次：正文与样例相等 -> 先等待配置时长，再返回按
+                    # 本次请求渲染的模板与配置状态 503；查询串原样保留
+                    # （加号、空值、无等号片段与百分号转义均不解码）
+                    start = time.monotonic()
+                    conn.request(
+                        "POST", "/checked?tag=a+z&tag=&flag&x=%2f",
+                        body=b'{"ok":true}',
+                    )
+                    resp = conn.getresponse()
+                    elapsed = time.monotonic() - start
+                    raw = resp.read()
+                    self.assertGreaterEqual(
+                        elapsed, DELAY_MIN_SECONDS,
+                        f"正文匹配：响应开始应不早于 {DELAY_MS}ms，实际 "
+                        f"{elapsed * 1000:.1f}ms（延迟应发生在响应开始之前）",
+                    )
+                    self._assert_json_response(
+                        "正文匹配", resp, raw, 503,
+                        {"text": "你好 POST /checked?"
+                                 "tag=a+z&tag=&flag&x=%2f"},
+                    )
+
+                    # 第二次：同一连接读完响应后继续请求，正文与样例不等 ->
+                    # 400 request_body_mismatch，不采用配置状态、模板正文，
+                    # 也不等待配置时长
+                    start = time.monotonic()
+                    conn.request(
+                        "POST", "/checked?x=other", body=b'{"ok":false}'
+                    )
+                    resp = conn.getresponse()
+                    elapsed = time.monotonic() - start
+                    raw = resp.read()
+                    self.assertLess(
+                        elapsed, NO_DELAY_MAX_SECONDS,
+                        f"正文不匹配：不应等待配置的 {DELAY_MS}ms，实际耗时 "
+                        f"{elapsed * 1000:.1f}ms",
+                    )
+                    self._assert_json_response(
+                        "正文不匹配", resp, raw, 400,
+                        {"error": "request_body_mismatch"},
+                    )
+                finally:
+                    conn.close()
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
