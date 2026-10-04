@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,12 +21,19 @@ REQUEST_BODY_MODES = ("exact", "subset")
 # "prefix" 将规则 path 作为前缀；取值区分大小写
 PATH_MODES = ("exact", "prefix")
 # bodyMode 的合法取值：省略或 "fixed" 为原有的固定响应（body 含占位符
-# 也原样返回），"template" 将 body 字符串值中的 {{request.path}} 替换为
-# 本次用于匹配的路径；取值区分大小写
+# 也原样返回），"template" 将 body 字符串值中的 {{request.path}} 与
+# {{request.method}} 分别替换为本次用于匹配的路径与请求方法（大写
+# GET/POST）；取值区分大小写
 BODY_MODES = ("fixed", "template")
-# template 模式下唯一识别的占位符：带空格、大小写不同的写法及其他
+# template 模式下仅识别的两个占位符：带空格、大小写不同的写法及其他
 # 占位符均保持原样
 PATH_PLACEHOLDER = "{{request.path}}"
+METHOD_PLACEHOLDER = "{{request.method}}"
+# 单次扫描同时匹配两种占位符：替换结果不再参与模板处理（路径文本中
+# 即使含有占位符形态的字符也不会被二次替换）
+_PLACEHOLDER_RE = re.compile(
+    "|".join((re.escape(PATH_PLACEHOLDER), re.escape(METHOD_PLACEHOLDER)))
+)
 
 
 class RulesError(Exception):
@@ -74,7 +82,7 @@ class Routes(dict):
     body_modes 为 {(method, path): "fixed"|"template"}，缺省 bodyMode 时
     记为 "fixed"，键集合与路由本身一致；
     template_bodies 为 {(method, path): body 原始 JSON 值}，仅含
-    bodyMode 为 "template" 的路由，供每次请求按当前路径渲染。
+    bodyMode 为 "template" 的路由，供每次请求按当前路径与方法渲染。
     """
 
 
@@ -179,23 +187,30 @@ def _json_subset(expected, actual):
     return _json_matches(expected, actual, allow_extra_keys=True)
 
 
-def _render_path_template(value, path):
+def _render_template(value, path, method):
     """template 模式的响应渲染：把字符串值中的 {{request.path}} 替换为
     本次用于匹配的路径（已去除查询串，大小写、尾斜杠与百分号转义按
-    原样保留，不额外解码或规范化）。
+    原样保留，不额外解码或规范化），把 {{request.method}} 替换为本次
+    请求的方法（大写 GET/POST，与查询参数和请求正文无关）。
 
     顶层及嵌套对象、数组中的字符串值均替换；对象键、非字符串值与
-    JSON 结构保持不变。str.replace 自左向右单次扫描，嵌入或重复的
-    占位符都被替换，且不会再次处理替换结果（路径文本中即使含有
-    占位符形态的字符也不会被二次替换）。不执行任何表达式。
+    JSON 结构保持不变。单次扫描同时处理两种占位符，嵌入、重复或
+    混合出现的占位符都被替换，且替换结果不再参与模板处理（替换
+    结果中即使含有占位符形态的字符也不会被二次替换）。不执行任何
+    表达式。
     """
     if isinstance(value, str):
-        return value.replace(PATH_PLACEHOLDER, path)
+        return _PLACEHOLDER_RE.sub(
+            lambda match: (
+                path if match.group(0) == PATH_PLACEHOLDER else method
+            ),
+            value,
+        )
     if isinstance(value, list):
-        return [_render_path_template(item, path) for item in value]
+        return [_render_template(item, path, method) for item in value]
     if isinstance(value, dict):
         return {
-            key: _render_path_template(item, path)
+            key: _render_template(item, path, method)
             for key, item in value.items()
         }
     return value
@@ -459,10 +474,11 @@ def _make_handler(routes):
             status, body = entry
             if routes.body_modes.get(key) == "template":
                 # 模板只作用于最终选中的路由：把 body 字符串值中的
-                # {{request.path}} 替换为本次用于匹配的路径后再序列化，
+                # {{request.path}} 与 {{request.method}} 分别替换为本次
+                # 用于匹配的路径与请求方法（大写 GET/POST）后再序列化，
                 # Content-Length 按替换后的 UTF-8 JSON 字节数给出
-                rendered = _render_path_template(
-                    routes.template_bodies[key], path
+                rendered = _render_template(
+                    routes.template_bodies[key], path, self.command
                 )
                 body = json.dumps(
                     rendered, ensure_ascii=False, separators=(",", ":")
