@@ -7413,5 +7413,202 @@ class CheckRulesEntryTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# 规则文件读取失败回归
+#
+# 下列用例只覆盖规则加载的文件读取、UTF-8 解码与 JSON 语法检查这条路径：
+# 对同一份坏文件，分别经 `python -m mock_server` 正常启动与
+# `--check-rules` 检查入口启动真实子进程，核对两种入口给出一致的确定
+# 结果（退出码 2、标准输出为空、标准错误以 error: 给出原因并包含样例
+# 文件名）。用例只观察公开命令行的退出码与两条输出流，不以内部函数
+# 返回值代替；进程须自行退出，超时即判失败并先回收进程与管道。
+# 另附一份合法中文规则作为对照：检查入口成功，正常启动可服务请求。
+# ---------------------------------------------------------------------------
+
+
+def run_startup_until_exit(rules_path, port, timeout=STARTUP_TIMEOUT):
+    """经公开命令行入口正常启动 mock_server，等待其【自行退出】。
+
+    用于规则加载失败场景：进程应以退出码 2 自行结束，不监听端口、
+    不等待请求或用户中断。返回 (returncode, stdout, stderr, elapsed)。
+    进程在 timeout 秒内未结束即判失败：杀掉并回收进程与管道后抛
+    AssertionError。即使调用方随后断言失败，进程也已退出、管道已
+    关闭，无资源残留。
+    """
+    command = [
+        sys.executable, "-m", "mock_server",
+        "--rules", str(rules_path),
+        "--port", str(port),
+    ]
+    proc = subprocess.Popen(
+        command,
+        cwd=str(PROJECT_ROOT),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    start = time.monotonic()
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # 超时判失败并回收进程，不通过等待用户中断完成测试
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise AssertionError(
+                f"mock_server 正常启动在 {timeout}s 内未自行退出"
+                f"（pid={proc.pid}），规则加载失败不应监听或等待请求"
+            )
+        elapsed = time.monotonic() - start
+        return proc.returncode, stdout, stderr, elapsed
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+class RulesFileReadFailureTests(unittest.TestCase):
+    """文件读取/解码/语法失败：正常启动与 --check-rules 结果一致。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_read_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        # 临时目录内从未创建的文件路径
+        cls.missing_path = Path(cls._tmp.name) / "rules_read_missing.json"
+        # 仅含原始字节 0xff 0xfe：不是合法 UTF-8
+        cls.bad_utf8_path = Path(cls._tmp.name) / "rules_read_bad_utf8.json"
+        cls.bad_utf8_path.write_bytes(b"\xff\xfe")
+        # UTF-8 合法但 JSON 语法被截断
+        cls.truncated_path = Path(cls._tmp.name) / "rules_read_truncated.json"
+        cls.truncated_path.write_bytes('{"routes":[\n'.encode("utf-8"))
+
+    def assert_load_failure(self, returncode, stdout, stderr, rules_path,
+                            fragment):
+        """两种入口共同的失败形态：退出码 2、stdout 空、stderr 给原因。
+
+        标准错误以 'error: ' 开头、包含样例文件名与固定原因片段；操作
+        系统附带原因（如 No such file or directory）不要求逐字相同。
+        输出中不得出现 Traceback、监听提示或校验成功提示。
+        """
+        self.assertEqual(
+            returncode, 2,
+            f"规则加载失败应返回退出码 2，实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        self.assertEqual(
+            stdout, "", f"失败时标准输出应为空，实际 {stdout!r}"
+        )
+        self.assertTrue(
+            stderr.startswith("error: "),
+            f"规则加载错误应以 'error: ' 开头，实际 stderr={stderr!r}",
+        )
+        self.assertIn(
+            rules_path.name, stderr,
+            f"标准错误应包含样例文件名 {rules_path.name!r}，"
+            f"实际 stderr={stderr!r}",
+        )
+        self.assertIn(
+            fragment, stderr,
+            f"标准错误应包含原因片段 {fragment!r}，实际 stderr={stderr!r}",
+        )
+        combined = stdout + stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn(STARTUP_MARKER, combined)
+        self.assertNotIn("rules valid", combined)
+
+    def assert_both_entries_fail(self, rules_path, fragment):
+        """同一份坏文件经两种入口启动，结果须一致。"""
+        port = free_port()
+        with self.subTest(entry="normal-startup"):
+            returncode, stdout, stderr, _ = run_startup_until_exit(
+                rules_path, port
+            )
+            self.assert_load_failure(
+                returncode, stdout, stderr, rules_path, fragment
+            )
+        with self.subTest(entry="check-rules"):
+            returncode, stdout, stderr, _ = run_check_rules(
+                rules_path, port=free_port()
+            )
+            self.assert_load_failure(
+                returncode, stdout, stderr, rules_path, fragment
+            )
+
+    def test_missing_file(self):
+        self.assertFalse(
+            self.missing_path.exists(),
+            f"样例路径应从未创建：{self.missing_path}",
+        )
+        self.assert_both_entries_fail(self.missing_path,
+                                      "cannot read rules file")
+
+    def test_invalid_utf8(self):
+        self.assert_both_entries_fail(self.bad_utf8_path,
+                                      "is not valid UTF-8")
+
+    def test_truncated_json(self):
+        self.assert_both_entries_fail(self.truncated_path,
+                                      "is not valid JSON")
+
+
+class ValidChineseRulesControlTests(unittest.TestCase):
+    """合法中文规则对照：检查成功且只有一行提示，启动后可服务 /hello。"""
+
+    CONTROL_ROUTES = [
+        {"method": "GET", "path": "/hello", "body": {"message": "你好"}},
+    ]
+    CONTROL_VALID_LINE = "mock_server rules valid (1 route(s))\n"
+
+    def write_control_rules(self, directory):
+        return write_rules(
+            directory, "rules_control_hello.json", self.CONTROL_ROUTES
+        )
+
+    def test_check_rules_valid(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = self.write_control_rules(tmp)
+            returncode, stdout, stderr, _ = run_check_rules(
+                rules_path, port=free_port()
+            )
+        self.assertEqual(
+            returncode, 0,
+            f"合法规则检查应成功（退出码 0），实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        # 标准输出只有这一行（含换行），标准错误为空
+        self.assertEqual(stdout, self.CONTROL_VALID_LINE)
+        self.assertEqual(stderr, "")
+
+    def test_startup_serves_hello(self):
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = self.write_control_rules(tmp)
+            port = free_port()
+            server = ServerProcess(rules_path, port)
+            try:
+                # ServerProcess 已等待标准输出出现监听提示
+                status, headers, raw = request(port, "GET", "/hello")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers.get("Content-Type"), CONTENT_TYPE)
+                expected = '{"message":"你好"}'.encode("utf-8")
+                self.assertEqual(raw, expected)
+                self.assertEqual(
+                    int(headers["Content-Length"]), len(expected)
+                )
+            finally:
+                server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
