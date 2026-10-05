@@ -7567,5 +7567,190 @@ class RulesFileReadErrorTests(unittest.TestCase):
             server.stop()
 
 
+# ---------------------------------------------------------------------------
+# 较长 UTF-8 正文的 requestBody 校验与连接复用回归
+#
+# 正文为仅含 text 键的 JSON 对象，值由直接编码（非 \uXXXX 转义）的汉字、
+# ASCII 填充字符与末尾 END 组成，UTF-8 编码后的完整 JSON 文本总长恰为
+# 65536 与 65537 字节（按字节数而非字符数）。规则中的 requestBody 与该
+# 对象相等，省略 requestBodyMode，配置 status 201 与 body
+# {"accepted":true}：相符正文返回 201 与配置响应；仅把末尾 END 改为
+# BAD（仍为合法 JSON、字节长度不变）返回 400 request_body_mismatch。
+# 两种结果在两种长度下都验证：读完 POST 响应后，在同一 TCP 连接（不重新
+# 建连）上 GET /hello 仍返回 200 与 {"message":"你好"}。
+# ---------------------------------------------------------------------------
+
+LONG_BODY_LENGTHS = (65536, 65537)
+LONG_BODY_REQUEST_TIMEOUT = 5.0
+LONG_BODY_CHINESE = "汉字" * 50  # 100 个汉字，UTF-8 直接编码共 300 字节
+LONG_BODY_ACCEPTED = b'{"accepted":true}'
+LONG_BODY_HELLO = '{"message":"你好"}'.encode("utf-8")
+
+
+def build_long_utf8_body(total_bytes, tail="END"):
+    """构造仅含 text 键的紧凑 JSON 正文及其 text 值。
+
+    值为「汉字 + ASCII 填充 + tail」，完整 JSON 文本的 UTF-8 编码总长
+    恰为 total_bytes 字节（不是字符数）。tail 取 END/BAD 等长替换时
+    字节数不变，正文仍是合法 JSON。
+    """
+    overhead = len(b'{"text":""}')
+    padding = (
+        total_bytes - overhead
+        - len(LONG_BODY_CHINESE.encode("utf-8"))
+        - len(tail.encode("utf-8"))
+    )
+    if padding < 0:
+        raise ValueError(f"目标长度 {total_bytes} 放不下汉字与结尾 {tail!r}")
+    value = LONG_BODY_CHINESE + "A" * padding + tail
+    body = json.dumps(
+        {"text": value}, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    if len(body) != total_bytes:  # 构造自检：长度按 UTF-8 字节数核对
+        raise AssertionError(
+            f"构造正文长度应为 {total_bytes} 字节，实际 {len(body)}"
+        )
+    return body, value
+
+
+def long_utf8_routes():
+    """每种长度一条 POST 校验规则（省略 requestBodyMode），外加 GET /hello。"""
+    routes = []
+    for length in LONG_BODY_LENGTHS:
+        _, value = build_long_utf8_body(length)
+        routes.append({
+            "method": "POST",
+            "path": f"/long-{length}",
+            "requestBody": {"text": value},
+            "status": 201,
+            "body": {"accepted": True},
+        })
+    routes.append({"method": "GET", "path": "/hello",
+                   "body": {"message": "你好"}})
+    return routes
+
+
+class LongUtf8RequestBodyTests(unittest.TestCase):
+    """65536/65537 字节 UTF-8 正文：完整参与校验，校验后连接仍可复用。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.rules_path = write_rules(
+            cls._tmp.name, "rules_long_utf8.json", long_utf8_routes()
+        )
+        cls.port = free_port()
+        cls.server = ServerProcess(cls.rules_path, cls.port)
+        cls.addClassCleanup(cls.server.stop)
+
+    def test_constructed_bodies_have_exact_byte_lengths(self):
+        # 构造自检：长度按字节数、汉字直接编码、改尾后等长且仍合法
+        for length in LONG_BODY_LENGTHS:
+            with self.subTest(正文长度=length):
+                body, value = build_long_utf8_body(length)
+                self.assertEqual(len(body), length)
+                self.assertEqual(
+                    json.loads(body.decode("utf-8")), {"text": value}
+                )
+                # 汉字以 UTF-8 字节直接出现在正文中，不是 \uXXXX 转义
+                self.assertIn("汉字".encode("utf-8"), body)
+                self.assertTrue(body.endswith(b'END"}'))
+                # 末尾 END 改 BAD：字节长度不变、仍是合法 JSON
+                bad, bad_value = build_long_utf8_body(length, tail="BAD")
+                self.assertEqual(len(bad), length)
+                self.assertEqual(
+                    json.loads(bad.decode("utf-8")), {"text": bad_value}
+                )
+                self.assertNotEqual(bad, body)
+
+    def _assert_post_then_get_on_same_connection(self, length, modified):
+        tail = "BAD" if modified else "END"
+        body, _ = build_long_utf8_body(length, tail=tail)
+        label = (
+            f"正文 {length} 字节、末尾{'改为 BAD' if modified else '保持 END'}"
+        )
+        expected_status = 400 if modified else 201
+        expected_body = (
+            REQUEST_BODY_MISMATCH if modified else LONG_BODY_ACCEPTED
+        )
+        conn = HTTPConnection(
+            "127.0.0.1", self.port, timeout=LONG_BODY_REQUEST_TIMEOUT
+        )
+        try:
+            # 阶段一：POST 完整长正文参与 requestBody 校验
+            conn.request("POST", f"/long-{length}", body=body)
+            resp = conn.getresponse()
+            raw = resp.read()
+            self.assertEqual(
+                resp.status, expected_status,
+                f"{label}：POST 阶段应返回 {expected_status}，实际 "
+                f"{resp.status}；响应={raw!r}",
+            )
+            self.assertEqual(
+                resp.getheader("Content-Type"), CONTENT_TYPE,
+                f"{label}：POST 阶段 Content-Type 应为 {CONTENT_TYPE!r}",
+            )
+            self.assertEqual(
+                raw, expected_body,
+                f"{label}：POST 阶段响应体应为 {expected_body!r}，"
+                f"实际 {raw!r}",
+            )
+            self.assertEqual(
+                int(resp.getheader("Content-Length")), len(raw),
+                f"{label}：POST 阶段 Content-Length 应等于响应体字节数",
+            )
+            # 校验结束后连接必须保持打开，不得关闭或重新建连
+            self.assertIsNotNone(
+                conn.sock,
+                f"{label}：POST 响应读完后连接被关闭，无法复用",
+            )
+            sock_after_post = conn.sock
+
+            # 阶段二：同一 TCP 连接上 GET /hello
+            conn.request("GET", "/hello")
+            resp = conn.getresponse()
+            raw = resp.read()
+            self.assertEqual(
+                resp.status, 200,
+                f"{label}：GET 阶段应返回 200，实际 {resp.status}；"
+                f"响应={raw!r}",
+            )
+            self.assertEqual(
+                resp.getheader("Content-Type"), CONTENT_TYPE,
+                f"{label}：GET 阶段 Content-Type 应为 {CONTENT_TYPE!r}",
+            )
+            self.assertEqual(
+                raw, LONG_BODY_HELLO,
+                f"{label}：GET 阶段响应体应为 {LONG_BODY_HELLO!r}，"
+                f"实际 {raw!r}",
+            )
+            self.assertEqual(
+                int(resp.getheader("Content-Length")), len(raw),
+                f"{label}：GET 阶段 Content-Length 应等于响应体字节数",
+            )
+            self.assertIs(
+                conn.sock, sock_after_post,
+                f"{label}：GET 应复用 POST 所在的同一 TCP 连接，"
+                f"实际发生了重新建连",
+            )
+        finally:
+            conn.close()
+
+    def test_matching_long_bodies_accepted_and_connection_reused(self):
+        for length in LONG_BODY_LENGTHS:
+            with self.subTest(正文长度=length, 末尾="END"):
+                self._assert_post_then_get_on_same_connection(
+                    length, modified=False
+                )
+
+    def test_tail_modified_long_bodies_rejected_and_connection_reused(self):
+        for length in LONG_BODY_LENGTHS:
+            with self.subTest(正文长度=length, 末尾="BAD"):
+                self._assert_post_then_get_on_same_connection(
+                    length, modified=True
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
