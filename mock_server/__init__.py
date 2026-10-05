@@ -27,8 +27,10 @@ PATH_MODES = ("exact", "prefix")
 # （第一个问号之后、井号之前的文本，不解码、不校验）、
 # {{request.pathSuffix}} 替换为最终选中前缀之后的路径剩余文本（exact
 # 命中时为空字符串）、{{request.queryParam.name}} 替换为本次原始查询串
-# 中参数 name 从左到右第一个匹配项的原始值（缺失时为空字符串）；
-# 取值区分大小写
+# 中参数 name 从左到右第一个匹配项的原始值（缺失时为空字符串）、
+# {{request.header.name}} 替换为本次请求中名称为 name 的请求头按标准库
+# HTTP 解析后的第一个值（头名称匹配不区分大小写；头缺失或值为空时为空
+# 字符串）；取值区分大小写
 BODY_MODES = ("fixed", "template")
 # template 模式下识别的四个固定占位符：带空格、大小写不同的写法及其他
 # 占位符均保持原样
@@ -36,15 +38,21 @@ PATH_PLACEHOLDER = "{{request.path}}"
 METHOD_PLACEHOLDER = "{{request.method}}"
 QUERY_PLACEHOLDER = "{{request.query}}"
 PATH_SUFFIX_PLACEHOLDER = "{{request.pathSuffix}}"
-# 此外识别一族参数占位符：前缀后接参数名并以 }} 收尾。参数名首字符限
-# ASCII 英文字母，后续字符限 ASCII 字母、数字或下划线，区分大小写；
-# 名称只在该正则内判定，规则加载不检查 body 中的占位符写法
+# 此外识别两族“前缀 + 名称 + }}”占位符，名称只在各自的正则内判定，规则
+# 加载不检查 body 中的占位符写法：
+# - queryParam：参数名首字符限 ASCII 英文字母，后续字符限 ASCII 字母、
+#   数字或下划线，区分大小写；
+# - header：头名称首字符限 ASCII 英文字母，后续字符限 ASCII 字母、数字
+#   或连字符（-），占位符前缀区分大小写、头名称匹配不区分大小写。
 QUERY_PARAM_PREFIX = "{{request.queryParam."
 QUERY_PARAM_NAME_RE = r"[A-Za-z][A-Za-z0-9_]*"
-# 单次自左向右扫描同时处理五个占位符形态，保证嵌入、重复与混合出现的
-# 占位符都被替换，且替换结果（如路径、参数值、剩余文本或查询文本中恰含
-# 占位符形态的字符）不再参与处理；queryParam 备选必须放在
-# {{request.query}} 之后，二者前缀不同（queryParam.），互不干扰
+HEADER_PREFIX = "{{request.header."
+HEADER_NAME_RE = r"[A-Za-z][A-Za-z0-9-]*"
+# 单次自左向右扫描同时处理六个占位符形态，保证嵌入、重复与混合出现的
+# 占位符都被替换，且替换结果（如路径、参数值、头值、剩余文本或查询文本
+# 中恰含占位符形态的字符）不再参与处理；queryParam 与 header 两个备选
+# 必须分别放在 {{request.query}} 之后（二者前缀 queryParam.、header.
+# 互不干扰），各捕获一个名称分组
 _TEMPLATE_PLACEHOLDER_RE = re.compile(
     re.escape(PATH_PLACEHOLDER)
     + "|"
@@ -57,6 +65,11 @@ _TEMPLATE_PLACEHOLDER_RE = re.compile(
     + re.escape(QUERY_PARAM_PREFIX)
     + "("
     + QUERY_PARAM_NAME_RE
+    + r")}}"
+    + "|"
+    + re.escape(HEADER_PREFIX)
+    + "("
+    + HEADER_NAME_RE
     + r")}}"
 )
 
@@ -111,7 +124,8 @@ class Routes(dict):
     记为 "fixed"，键集合与路由本身一致；
     template_bodies 为 {(method, path): body 原始 JSON 值}，仅含
     bodyMode 为 "template" 的路由，供每次请求按当前方法、路径、查询串
-    （含由其现算的单个查询参数原始值）与路径剩余文本渲染。
+    （含由其现算的单个查询参数原始值）、路径剩余文本与请求头
+    （由本次请求头现取的首个同名头值）渲染。
     """
 
 
@@ -237,7 +251,27 @@ def _query_params(query):
     return params
 
 
-def _render_template(value, path, method, query, path_suffix, query_params):
+def _first_headers(headers):
+    """把标准库解析后的请求头收集为 {小写名称: 第一个值} 映射。
+
+    遍历 email.message.Message.items()（HTTP 头由其 parse_headers 解析
+    得到），同名头按报文从上到下的顺序出现，只保留第一项——即使第一项
+    的值为空字符串也不被后续同名头覆盖；键统一小写，占位符取值时按小写
+    匹配，故头名称匹配不区分大小写。值就是标准库 HTTP 解析后的文本
+    （字段值前导的可选空白由解析器按协议折叠处理，其余空白原样保留），
+    这里不额外去除首尾空白，也不做 URL 解码、逗号分割或类型转换，'+'
+    与百分号转义原样保留；头缺失或值为空时由渲染侧按空字符串处理。
+    """
+    first = {}
+    for name, value in headers.items():
+        key = name.lower()
+        if key not in first:
+            first[key] = value
+    return first
+
+
+def _render_template(value, path, method, query, path_suffix, query_params,
+                     headers):
     """template 模式的响应渲染：把字符串值中的 {{request.path}} 替换为
     本次用于匹配的路径（已去除查询串，大小写、尾斜杠与百分号转义按
     原样保留，不额外解码或规范化）、{{request.method}} 替换为本次请求
@@ -254,22 +288,37 @@ def _render_template(value, path, method, query, path_suffix, query_params):
     name 的参数从左到右第一个片段的原始值（name 首字符限 ASCII 字母，
     后续字符限 ASCII 字母、数字或下划线，区分大小写；不解码、'+' 不变
     空格、不做类型转换；没有等号时值为空；缺失参数、没有查询串或仅有
-    结尾问号时为空字符串；第一个匹配项即使为空也不跳过）。
+    结尾问号时为空字符串；第一个匹配项即使为空也不跳过）、
+    {{request.header.name}} 替换为本次请求中名称为 name 的请求头经标准
+    库 HTTP 解析后的第一个值（name 首字符限 ASCII 字母，后续字符限
+    ASCII 字母、数字或连字符；占位符前缀区分大小写，头名称匹配不区分
+    大小写，如 x-trace-id 与 X-Trace-Id 都能取到 {{request.header.
+    X-Trace-Id}}；同名头按报文从上到下只取第一项，即使第一项为空也不
+    跳过、不拼接后续项；头值不额外去除首尾空白，不解码、不按逗号分割、
+    不做类型转换，'+' 与百分号转义原样保留；头缺失或值为空时为空
+    字符串）。
 
     顶层及嵌套对象、数组中的字符串值均替换；对象键、非字符串值与
     JSON 结构保持不变。正则自左向右单次扫描，嵌入、重复或混合出现
-    的占位符都被替换，且不会再次处理替换结果（路径、参数值、剩余文本、
-    方法或查询文本中即使含有占位符形态的字符也不会被二次替换）。
-    参数名缺失或不合名称规则的写法（如 {{request.queryParam.}}、
-    {{request.queryParam.1x}}）、带空格、前缀大小写不同的写法及其他
+    的占位符都被替换，且不会再次处理替换结果（路径、参数值、头值、
+    剩余文本、方法或查询文本中即使含有占位符形态的字符也不会被二次
+    替换）。参数名或头名称缺失或不合名称规则的写法（如
+    {{request.queryParam.}}、{{request.queryParam.1x}}、
+    {{request.header.}}、{{request.header.1x}}、
+    {{request.header.x_y}}）、带空格、前缀大小写不同的写法及其他
     未知占位符保持原样，不执行任何表达式，也不尝试取值。
     """
     if isinstance(value, str):
         def _replace(match):
-            name = match.group(1)
-            if name is not None:
+            param_name = match.group(1)
+            if param_name is not None:
                 # {{request.queryParam.<name>}}：缺失名称得到空字符串
-                return query_params.get(name, "")
+                return query_params.get(param_name, "")
+            header_name = match.group(2)
+            if header_name is not None:
+                # {{request.header.<name>}}：头名称不区分大小写，缺失头或
+                # 头值为空都得到空字符串；映射只保留同名头的第一项
+                return headers.get(header_name.lower(), "")
             token = match.group(0)
             if token == PATH_PLACEHOLDER:
                 return path
@@ -283,14 +332,14 @@ def _render_template(value, path, method, query, path_suffix, query_params):
     if isinstance(value, list):
         return [
             _render_template(
-                item, path, method, query, path_suffix, query_params
+                item, path, method, query, path_suffix, query_params, headers
             )
             for item in value
         ]
     if isinstance(value, dict):
         return {
             key: _render_template(
-                item, path, method, query, path_suffix, query_params
+                item, path, method, query, path_suffix, query_params, headers
             )
             for key, item in value.items()
         }
@@ -519,7 +568,7 @@ def load_rules(path):
     路由都有键，缺省 bodyMode 时记为 "fixed"；
     template_bodies 属性为 {(method, path): body 原始 JSON 值} 映射，
     仅包含 bodyMode 为 "template" 的路由，供每次命中按当前方法、路径、
-    查询串与路径剩余文本渲染。
+    查询串、路径剩余文本与本次请求头渲染。
     """
     routes = Routes()
     routes.delays = {}
@@ -541,8 +590,8 @@ def load_rules(path):
         routes.body_modes[key] = entry.body_mode
         if entry.body_mode == "template":
             # 模板路由保留 body 的原始 JSON 值，每次命中按当前方法、路径、
-            # 查询串与路径剩余文本渲染；选项校验中的序列化已保证其中字符串
-            # 值与对象键可编码为 UTF-8
+            # 查询串、路径剩余文本与本次请求头渲染；选项校验中的序列化已
+            # 保证其中字符串值与对象键可编码为 UTF-8
             routes.template_bodies[key] = entry.template_body
         if entry.request_body_present:
             routes.request_bodies[key] = entry.request_body_sample
@@ -657,9 +706,12 @@ def _make_handler(routes):
                 # {{request.pathSuffix}} 替换为最终选中前缀之后的路径
                 # 剩余文本（exact 命中时为空字符串）、
                 # {{request.queryParam.name}} 替换为参数 name 的第一个
-                # 原始值（缺失时为空字符串）后再序列化，
-                # Content-Length 按替换后的 UTF-8 JSON 字节数给出。
-                # 参数映射每次请求由本次查询串现算，不跨请求沿用
+                # 原始值（缺失时为空字符串）、
+                # {{request.header.name}} 替换为请求头 name 经标准库
+                # 解析后的第一个值（名称不区分大小写，缺失时为空
+                # 字符串）后再序列化，Content-Length 按替换后的 UTF-8
+                # JSON 字节数给出。参数映射每次请求由本次查询串现算，
+                # 头映射每次请求由本次请求头现取，均不跨请求沿用
                 rendered = _render_template(
                     routes.template_bodies[key],
                     path,
@@ -667,6 +719,7 @@ def _make_handler(routes):
                     query,
                     path_suffix,
                     _query_params(query),
+                    _first_headers(self.headers),
                 )
                 body = json.dumps(
                     rendered, ensure_ascii=False, separators=(",", ":")

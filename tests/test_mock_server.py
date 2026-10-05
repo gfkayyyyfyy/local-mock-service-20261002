@@ -6472,6 +6472,479 @@ class QueryParamTemplateTests(unittest.TestCase):
             self.assertIn(b"rules valid", proc.stdout)
 
 
+class HeaderTemplateTests(unittest.TestCase):
+    """{{request.header.name}}：按本次请求头取标准库解析后的第一个值，
+    头名称匹配不区分大小写、缺失或空值为空字符串、同名头只取第一项；
+    其余模板规则与既有占位符一致。"""
+
+    def _start(self, tmp, name, routes):
+        rules_path = write_rules(tmp, name, routes)
+        port = free_port()
+        server = ServerProcess(rules_path, port)
+        self.addCleanup(server.stop)
+        return port
+
+    @staticmethod
+    def _exchange(conn, method, target, headers=(), body=None):
+        # headers 允许为 (名称, 值) 元组序列，同名元组按顺序各发一行，
+        # 可构造重复请求头（HTTPConnection.request 只接受映射、无法发送
+        # 同名头，故直接用 putrequest/putheader）；返回 (状态码, 响应头,
+        # 原始响应体)
+        conn.putrequest(method, target)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        if body is not None:
+            conn.putheader("Content-Length", str(len(body)))
+        for name, value in headers:
+            conn.putheader(name, value)
+        conn.endheaders()
+        if body is not None:
+            conn.send(body)
+        resp = conn.getresponse()
+        raw = resp.read()
+        resp_headers = {k: v for k, v in resp.getheaders()}
+        return resp.status, resp_headers, raw
+
+    def _echo_route(self):
+        return {"method": "GET", "path": "/echo",
+                "bodyMode": "template",
+                "body": {"trace": "{{request.header.X-Trace-Id}}"}}
+
+    def test_spec_acceptance_with_shipped_rules_on_same_connection(self):
+        # 验收：以启动入口加载自带 rules.json 的 GET /echo 模板，
+        # x-trace-id: A%2Fb+Z 返回 {"trace":"A%2Fb+Z"}；同一连接下一次
+        # 不带该头返回 {"trace":""}，不沿用上一次值
+        rules_path = PROJECT_ROOT / "rules.json"
+        port = free_port()
+        server = ServerProcess(rules_path, port)
+        try:
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                status, headers, raw = self._exchange(
+                    conn, "GET", "/echo",
+                    headers=[("x-trace-id", "A%2Fb+Z")],
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(raw, b'{"trace":"A%2Fb+Z"}')
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                status, headers, raw = self._exchange(conn, "GET", "/echo")
+                self.assertEqual(status, 200)
+                self.assertEqual(raw, b'{"trace":""}')
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+            finally:
+                conn.close()
+        finally:
+            server.stop()
+
+    def test_value_kept_verbatim_no_trim_no_decode_no_split_no_conversion(
+        self,
+    ):
+        # 头值取标准库 HTTP 解析后的文本：不额外去除首尾空白（字段值前导
+        # OWS 由标准库解析器按协议处理，尾部空白保留），不做 URL 解码、
+        # 不按逗号分割、'+' 不转空格、文本不转换类型
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_verbatim.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"v": "{{request.header.X-V}}"}},
+            ])
+            cases = [
+                ("A%2Fb+Z", "A%2Fb+Z"),
+                ("a+b+c", "a+b+c"),
+                ("a,b,c", "a,b,c"),
+                ("123", "123"),
+                ("true", "true"),
+                ("null", "null"),
+                ("%ZZ", "%ZZ"),
+                ("trail  ", "trail  "),
+                ('a"b\\c', 'a"b\\c'),
+            ]
+            for value, expected in cases:
+                with self.subTest(value=value):
+                    conn = HTTPConnection(
+                        "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+                    )
+                    try:
+                        status, resp_headers, raw = self._exchange(
+                            conn, "GET", "/echo",
+                            headers=[("X-V", value)],
+                        )
+                    finally:
+                        conn.close()
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")), {"v": expected}
+                    )
+                    self.assertEqual(
+                        int(resp_headers["Content-Length"]), len(raw)
+                    )
+
+    def test_duplicate_headers_first_wins_even_when_first_empty(self):
+        # 同名头按报文从上到下只取第一项：首项为空也不跳过、不拼接
+        # 后续项；不同大小写写法的同名头同样只取第一项
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_first.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"t": "{{request.header.X-Trace-Id}}",
+                          "e": "{{request.header.X-Empty}}"}},
+            ])
+            cases = [
+                ([("X-Trace-Id", "first"), ("X-Trace-Id", "second")],
+                 {"t": "first", "e": ""}),
+                ([("x-trace-id", "low"), ("X-TRACE-ID", "up")],
+                 {"t": "low", "e": ""}),
+                # 第一项为空：不被后续非空项覆盖
+                ([("X-Empty", ""), ("X-Empty", "later")],
+                 {"t": "", "e": ""}),
+            ]
+            for req_headers, expected in cases:
+                with self.subTest(headers=req_headers):
+                    conn = HTTPConnection(
+                        "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+                    )
+                    try:
+                        status, _, raw = self._exchange(
+                            conn, "GET", "/echo", headers=req_headers
+                        )
+                    finally:
+                        conn.close()
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")), expected
+                    )
+
+    def test_header_name_case_insensitive_but_placeholder_prefix_case_sensitive(
+        self,
+    ):
+        # 头名称匹配不区分大小写；名称允许字母开头、后续为字母数字连字符；
+        # 占位符前缀 request.header 区分大小写
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_names.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {
+                     "trace": "{{request.header.X-Trace-Id}}",
+                     "a": "{{request.header.a}}",
+                     "b1": "{{request.header.B1}}",
+                     "z_9": "{{request.header.Z-9}}",
+                 }},
+            ])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                status, _, raw = self._exchange(
+                    conn, "GET", "/echo",
+                    headers=[("x-TRACE-id", "T"), ("A", "aa"),
+                             ("b1", "bb"), ("z-9", "cc")],
+                )
+            finally:
+                conn.close()
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"trace": "T", "a": "aa", "b1": "bb", "z_9": "cc"},
+            )
+
+    def test_missing_or_empty_header_replaced_with_empty_string(self):
+        # 头缺失或字段值为空都替换为空字符串；嵌入形态同样塌缩
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_missing.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"plain": "{{request.header.X-Missing}}",
+                          "embed": "x{{request.header.X-Missing}}y",
+                          "empty": "[{{request.header.X-Empty}}]"}},
+            ])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                # 不带任何相关头
+                status, headers, raw = self._exchange(conn, "GET", "/echo")
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")),
+                    {"plain": "", "embed": "xy", "empty": "[]"},
+                )
+                self.assertEqual(int(headers["Content-Length"]), len(raw))
+                # 显式空值头
+                status, _, raw = self._exchange(
+                    conn, "GET", "/echo", headers=[("X-Empty", "")]
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")),
+                    {"plain": "", "embed": "xy", "empty": "[]"},
+                )
+            finally:
+                conn.close()
+
+    def test_malformed_and_unknown_placeholders_kept_verbatim(self):
+        # 前缀大小写不符、整体或头名称内部带空格、名称缺失或不合名称
+        # 规则、缺少 }}、未知占位符均保持原样，不尝试取值
+        body = {
+            "spaced_outer": "{{ request.header.X }}",
+            "spaced_name": "{{request.header. X}}",
+            "space_in_name": "{{request.header.x y}}",
+            "lower_prefix": "{{request.Header.X}}",
+            "plural": "{{request.headers.X}}",
+            "missing_name": "{{request.header.}}",
+            "leading_digit": "{{request.header.1x}}",
+            "underscore": "{{request.header.x_y}}",
+            "dot": "{{request.header.x.y}}",
+            "double_hyphen_ok": "{{request.header.X--Y}}",
+            "unclosed": "{{request.header.X",
+            "unknown": "{{request.foo}}",
+            "good": "[{{request.header.X-Good}}]",
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_malformed.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": body},
+            ])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                status, _, raw = self._exchange(
+                    conn, "GET", "/echo",
+                    headers=[("X-Good", "9"), ("X", "skip"),
+                             ("x_y", "skip"), ("1x", "skip")],
+                )
+            finally:
+                conn.close()
+            self.assertEqual(status, 200)
+            expected = dict(body)
+            # 名称中允许连字符，X--Y 是合法头名；该头未发送故为空
+            expected["double_hyphen_ok"] = ""
+            expected["good"] = "[9]"
+            self.assertEqual(json.loads(raw.decode("utf-8")), expected)
+
+    def test_nested_repeated_embedded_mixed_values_replaced(self):
+        # 顶层及嵌套对象、数组中的字符串值均替换；嵌入、重复及与全部已有
+        # 占位符混用都生效；对象键、非字符串值与 JSON 结构不变
+        body = {
+            "{{request.header.X-Trace-Id}}": "键名保持原样",
+            "embed": "x{{request.header.X-Trace-Id}}y",
+            "repeat": "<{{request.header.X-Trace-Id}}>"
+                      "<{{request.header.X-Trace-Id}}>",
+            "mix": "{{request.path}}|{{request.method}}|{{request.query}}|"
+                   "{{request.pathSuffix}}|{{request.queryParam.a}}|"
+                   "{{request.header.X-Trace-Id}}",
+            "nested": {"list": ["{{request.header.X-Trace-Id}}", 1, 1.5,
+                                True, None,
+                                ["z={{request.header.X-Other}}"]]},
+        }
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_nested.json", [
+                {"method": "GET", "path": "/p/", "pathMode": "prefix",
+                 "bodyMode": "template", "body": body},
+            ])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                status, headers, raw = self._exchange(
+                    conn, "GET", "/p/sub?a=1&a=3",
+                    headers=[("X-Trace-Id", "H1"), ("X-Other", "H2")],
+                )
+            finally:
+                conn.close()
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {
+                    "{{request.header.X-Trace-Id}}": "键名保持原样",
+                    "embed": "xH1y",
+                    "repeat": "<H1><H1>",
+                    "mix": "/p/sub|GET|a=1&a=3|sub|1|H1",
+                    "nested": {"list": ["H1", 1, 1.5, True, None,
+                                        ["z=H2"]]},
+                },
+            )
+            self.assertEqual(int(headers["Content-Length"]), len(raw))
+
+    def test_replacement_text_is_not_reprocessed(self):
+        # 头值中即使含占位符形态（含 header 自身）也不再展开
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_reprocess.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {
+                     "t": "{{request.header.X-Trace-Id}}",
+                     "p": "{{request.header.X-Path}}",
+                 }},
+            ])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                status, _, raw = self._exchange(
+                    conn, "GET", "/echo",
+                    headers=[
+                        ("X-Trace-Id", "{{request.header.X-Path}}"),
+                        ("X-Path", "LEAKED"),
+                    ],
+                )
+            finally:
+                conn.close()
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(raw.decode("utf-8")),
+                {"t": "{{request.header.X-Path}}", "p": "LEAKED"},
+            )
+
+    def test_each_request_uses_its_own_headers_on_same_connection(self):
+        # 同一连接连续请求：头值只来自本次请求头，不沿用前次结果
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_conn.json",
+                               [self._echo_route()])
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                for req_headers, expected in (
+                    ([("X-Trace-Id", "first")], b'{"trace":"first"}'),
+                    ([("X-Trace-Id", "second")], b'{"trace":"second"}'),
+                    ((), b'{"trace":""}'),
+                    ([("x-trace-id", "again")], b'{"trace":"again"}'),
+                    ([("Other", "x")], b'{"trace":""}'),
+                ):
+                    status, resp_headers, raw = self._exchange(
+                        conn, "GET", "/echo", headers=req_headers
+                    )
+                    self.assertEqual(status, 200)
+                    self.assertEqual(raw, expected)
+                    self.assertEqual(
+                        int(resp_headers["Content-Length"]), len(raw)
+                    )
+            finally:
+                conn.close()
+
+    def test_headers_do_not_participate_in_routing_or_body_match(self):
+        # 任意请求头不改变路由选择结果；头不参与 requestBody 比较：
+        # 同样的正文带不带头都通过校验，且命中后模板才渲染头
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_route.json", [
+                self._echo_route(),
+                {"method": "GET", "path": "/api/", "pathMode": "prefix",
+                 "body": {"v": 1}},
+                {"method": "POST", "path": "/checked",
+                 "bodyMode": "template",
+                 "requestBody": {"ok": True},
+                 "body": {"t": "{{request.header.X-Trace-Id}}"}},
+            ])
+            # 头不影响 exact/prefix 选择与 404
+            for headers in ((), [("X-Trace-Id", "x")]):
+                with self.subTest(headers=headers):
+                    conn = HTTPConnection(
+                        "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+                    )
+                    try:
+                        status, _, raw = self._exchange(
+                            conn, "GET", "/api/x", headers=headers
+                        )
+                        self.assertEqual(status, 200)
+                        self.assertEqual(
+                            json.loads(raw.decode("utf-8")), {"v": 1}
+                        )
+                        status, _, raw = self._exchange(
+                            conn, "GET", "/nope", headers=headers
+                        )
+                        self.assertEqual(status, 404)
+                    finally:
+                        conn.close()
+            # 头不参与正文比较：正文相同即通过，通过后渲染头
+            conn = HTTPConnection(
+                "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+            )
+            try:
+                status, _, raw = self._exchange(
+                    conn, "POST", "/checked",
+                    headers=[("X-Trace-Id", "T")],
+                    body=b'{"ok":true}',
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"t": "T"})
+                status, _, raw = self._exchange(
+                    conn, "POST", "/checked", body=b'{"ok":true}'
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw.decode("utf-8")),
+                                 {"t": ""})
+                # 正文不匹配仍返回固定 400，头值不泄漏到响应中
+                status, _, raw = self._exchange(
+                    conn, "POST", "/checked",
+                    headers=[("X-Trace-Id", "should_not_appear")],
+                    body=b'{"ok":false}',
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8")),
+                    {"error": "request_body_mismatch"},
+                )
+            finally:
+                conn.close()
+
+    def test_fixed_and_default_mode_keep_placeholder_verbatim(self):
+        # 省略 bodyMode 或取 fixed 时 header 占位符原样返回
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            port = self._start(tmp, "rules_hdr_fixed.json", [
+                {"method": "GET", "path": "/default",
+                 "body": {"v": "{{request.header.X-Trace-Id}}"}},
+                {"method": "GET", "path": "/fixed", "bodyMode": "fixed",
+                 "body": {"v": "{{request.header.X-Trace-Id}}"}},
+            ])
+            for target in ("/default", "/fixed"):
+                with self.subTest(target=target):
+                    conn = HTTPConnection(
+                        "127.0.0.1", port, timeout=REQUEST_TIMEOUT
+                    )
+                    try:
+                        status, _, raw = self._exchange(
+                            conn, "GET", target,
+                            headers=[("X-Trace-Id", "x")],
+                        )
+                    finally:
+                        conn.close()
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(raw.decode("utf-8")),
+                        {"v": "{{request.header.X-Trace-Id}}"},
+                    )
+
+    def test_rules_load_and_check_rules_unaffected_by_placeholders(self):
+        # 占位符只是 body 字符串文本：不合规则的写法（缺名称、首字符
+        # 数字、下划线等）不影响规则加载与 --check-rules
+        weird = "{{request.header.}} {{request.header.1x}} " \
+                "{{request.header.x_y}} {{ request.header.X }} " \
+                "{{request.Header.X}}"
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_hdr_load.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"v": weird}},
+            ])
+            from mock_server import load_rules
+            routes = load_rules(rules_path)
+            self.assertEqual(routes.body_modes[("GET", "/echo")],
+                             "template")
+        with tempfile.TemporaryDirectory(prefix="mock_server_test_") as tmp:
+            rules_path = write_rules(tmp, "rules_hdr_check.json", [
+                {"method": "GET", "path": "/echo", "bodyMode": "template",
+                 "body": {"v": weird}},
+            ])
+            proc = subprocess.run(
+                [sys.executable, "-m", "mock_server",
+                 "--rules", str(rules_path), "--check-rules"],
+                cwd=str(PROJECT_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(proc.returncode, 0,
+                             proc.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"rules valid", proc.stdout)
+
+
 INVALID_BODY_MODES = [
     ('大小写不同 "Fixed"', "Fixed"),
     ('大小写不同 "TEMPLATE"', "TEMPLATE"),
