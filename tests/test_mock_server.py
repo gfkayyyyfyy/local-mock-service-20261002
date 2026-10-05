@@ -7413,5 +7413,159 @@ class CheckRulesEntryTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# 规则文件读取失败回归：正常启动与 --check-rules 对同一坏文件的确定结果
+#
+# 只覆盖加载路径上的文件读取、UTF-8 解码与 JSON 语法检查：从未创建的
+# 文件路径、仅含原始字节 0xff 0xfe 的文件、UTF-8 内容为 {"routes":[ 的
+# 截断文件。每种输入都经两条公开命令行入口验证——正常启动
+# （python -m mock_server --rules ... --port ...）与附加 --check-rules
+# 的规则检查——两者均应以退出码 2 自行结束、标准输出为空、标准错误以
+# error: 开头并包含样例文件名与相同原因，不出现 Traceback、监听提示或
+# 校验成功提示。另以一份合法中文规则作对照，核对检查入口的成功输出与
+# 正常启动后的真实 GET 响应。全部用例只依赖标准库、临时文件与回环地址。
+# ---------------------------------------------------------------------------
+
+
+class RulesFileReadErrorTests(unittest.TestCase):
+    """规则文件读取/解码/语法失败：两条入口一致的退出码与错误输出。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix="mock_server_test_read_")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        # 临时目录内从未创建的文件路径
+        cls.missing_path = Path(cls._tmp.name) / "rules_missing.json"
+        # 仅含原始字节 0xff 0xfe：不是合法 UTF-8
+        cls.invalid_utf8_path = Path(cls._tmp.name) / "rules_not_utf8.json"
+        cls.invalid_utf8_path.write_bytes(b"\xff\xfe")
+        # UTF-8 合法但 JSON 被截断
+        cls.truncated_path = write_rules_text(
+            cls._tmp.name, "rules_truncated.json", '{"routes":['
+        )
+        # 对照用合法中文规则：routes 只含一条 GET /hello
+        cls.valid_chinese_path = write_rules(
+            cls._tmp.name,
+            "rules_valid_chinese.json",
+            [{"method": "GET", "path": "/hello",
+              "body": {"message": "你好"}}],
+        )
+
+    def assert_load_failure(self, returncode, stdout, stderr, path, fragment,
+                            entry_label):
+        """单条入口对坏文件的共同期望：退出码 2、stdout 为空、stderr 以
+        error: 开头、包含样例文件名与原因片段，且无 Traceback、监听提示
+        或校验成功提示。"""
+        self.assertEqual(
+            returncode, 2,
+            f"{entry_label}：规则加载失败应返回退出码 2，实际 "
+            f"{returncode}；stdout={stdout!r} stderr={stderr!r}",
+        )
+        self.assertEqual(
+            stdout, "",
+            f"{entry_label}：失败时标准输出应为空，实际 {stdout!r}",
+        )
+        self.assertTrue(
+            stderr.startswith("error: "),
+            f"{entry_label}：标准错误应以 'error: ' 开头，实际 "
+            f"stderr={stderr!r}",
+        )
+        self.assertIn(
+            fragment, stderr,
+            f"{entry_label}：标准错误应包含原因片段 {fragment!r}，实际 "
+            f"stderr={stderr!r}",
+        )
+        self.assertIn(
+            path.name, stderr,
+            f"{entry_label}：标准错误应包含样例文件名 {path.name!r}，实际 "
+            f"stderr={stderr!r}",
+        )
+        self.assertNotIn(
+            "Traceback", stderr,
+            f"{entry_label}：不应出现 Python 异常回溯，实际 "
+            f"stderr={stderr!r}",
+        )
+        self.assertNotIn(
+            STARTUP_MARKER, stdout + stderr,
+            f"{entry_label}：不应出现监听提示，实际 stdout={stdout!r} "
+            f"stderr={stderr!r}",
+        )
+        self.assertNotIn(
+            "rules valid", stdout + stderr,
+            f"{entry_label}：不应出现校验成功提示，实际 stdout={stdout!r} "
+            f"stderr={stderr!r}",
+        )
+
+    def assert_both_entries_fail(self, path, fragment):
+        """同一坏文件经正常启动与 --check-rules 两条入口验证：结果一致。
+
+        两个进程都应在各自超时上界内自行退出（辅助函数在超时后杀掉进程
+        并判失败），返回前进程与管道均已回收。
+        """
+        port = free_port()
+        start_rc, start_out, start_err = start_and_wait_exit(path, port)
+        check_rc, check_out, check_err, _ = run_check_rules(path, port=port)
+        self.assert_load_failure(
+            start_rc, start_out, start_err, path, fragment, "正常启动"
+        )
+        self.assert_load_failure(
+            check_rc, check_out, check_err, path, fragment, "--check-rules"
+        )
+        # 两条入口走同一加载路径，对同一坏文件给出逐字相同的错误输出
+        self.assertEqual(
+            start_err, check_err,
+            f"正常启动与 --check-rules 对同一坏文件的标准错误应一致："
+            f"启动 stderr={start_err!r}，检查 stderr={check_err!r}",
+        )
+
+    def test_missing_file_fails_in_both_entries(self):
+        self.assert_both_entries_fail(
+            self.missing_path, "cannot read rules file"
+        )
+
+    def test_invalid_utf8_fails_in_both_entries(self):
+        self.assert_both_entries_fail(
+            self.invalid_utf8_path, "is not valid UTF-8"
+        )
+
+    def test_truncated_json_fails_in_both_entries(self):
+        self.assert_both_entries_fail(
+            self.truncated_path, "is not valid JSON"
+        )
+
+    def test_valid_chinese_rules_check_entry(self):
+        # 对照：合法中文规则经检查入口，退出码 0、stderr 为空、stdout
+        # 只有一行成功提示
+        returncode, stdout, stderr, _ = run_check_rules(
+            self.valid_chinese_path, port=free_port()
+        )
+        self.assertEqual(
+            returncode, 0,
+            f"合法规则检查应成功（退出码 0），实际 {returncode}；"
+            f"stdout={stdout!r} stderr={stderr!r}",
+        )
+        self.assertEqual(
+            stdout, "mock_server rules valid (1 route(s))\n",
+            f"标准输出应只有一行成功提示，实际 {stdout!r}",
+        )
+        self.assertEqual(
+            stderr, "", f"成功时标准错误应为空，实际 {stderr!r}"
+        )
+
+    def test_valid_chinese_rules_serves_hello(self):
+        # 对照：正常启动出现监听提示后，GET /hello 返回 200 与中文正文
+        port = free_port()
+        server = ServerProcess(self.valid_chinese_path, port)
+        try:
+            status, headers, raw = request(port, "GET", "/hello")
+            self.assertEqual(status, 200, f"GET /hello 应返回 200，实际 {status}")
+            self.assertEqual(
+                raw, '{"message":"你好"}'.encode("utf-8"),
+                f"响应体应为紧凑 UTF-8 JSON，实际 {raw!r}",
+            )
+        finally:
+            server.stop()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
